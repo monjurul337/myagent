@@ -216,7 +216,8 @@ class GeckoBrowser {
   /// the next report shows which side of the bridge the job is
   /// stuck on.
   Future<bool> startVideoHeadless(
-      String prompt, String modelId, String jobId) async {
+      String prompt, String modelId, String jobId,
+      {int count = 1}) async {
     try {
       final posted = await _ch.invokeMethod<bool>(
           'browserVideoHeadless',
@@ -224,6 +225,8 @@ class GeckoBrowser {
             'prompt': prompt,
             'model': modelId,
             'jobId': jobId,
+            // v169 — batch: how many videos this ONE message asks for.
+            if (count > 1) 'count': count,
           }));
       return posted ?? false;
     } catch (_) {

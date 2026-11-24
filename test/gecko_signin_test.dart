@@ -74,7 +74,7 @@ void main() {
     // The Login screen shows the build, so its screenshots prove
     // which version is installed.
     final login = await File('lib/login_screen.dart').readAsString();
-    expect(login, contains('App v2.5.93'));
+    expect(login, contains('App v2.5.102'));
   });
 
   test('v121: the browser reads the session token off its own page',

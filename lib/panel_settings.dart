@@ -3,6 +3,10 @@
 // Firebase accounts, default target, Test DB, Save). The Cloudinary
 // AI Upscale credentials are NOT here: they stay backend-only,
 // embedded in the app code (user order 2026-11-09).
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import 'models.dart';
@@ -127,6 +131,84 @@ class _PanelSettingsScreenState extends State<PanelSettingsScreen> {
     }
   }
 
+  DistConfig _formConfig() {
+    final accounts = _accounts
+        .map((c) => c.toAccount())
+        .where((a) => a.name.isNotEmpty && a.dbUrl.isNotEmpty)
+        .toList();
+    return DistConfig(
+      r2WorkerUrl: _r2Ctrl.text.trim(),
+      queuePath: _queueCtrl.text.trim().isEmpty
+          ? 'wallpaperQueue'
+          : _queueCtrl.text.trim(),
+      accounts: accounts,
+      defaultTarget: _defaultTarget,
+    );
+  }
+
+  /// v169 — Backup: writes the R2 Worker URL, queue path and every
+  /// Firebase account (URL + secret) to a .json file the user
+  /// saves in Downloads / Drive. App data is deleted on uninstall,
+  /// a file saved outside the app is not.
+  Future<void> _backup() async {
+    final cfg = _formConfig();
+    if (cfg.r2WorkerUrl.isEmpty && cfg.accounts.isEmpty) {
+      setState(() => _testStatus = 'Backup-er moto kichu nei — age R2/Firebase dao.');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      final json = const JsonEncoder.withIndent('  ').convert({
+        'zedgeStudioBackup': 1,
+        ...cfg.toJson(),
+      });
+      final saved = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save settings backup',
+        fileName: 'zedge_studio_settings_backup.json',
+        bytes: Uint8List.fromList(utf8.encode(json)),
+      );
+      setState(() => _testStatus = saved == null
+          ? 'Backup cancel holo.'
+          : 'Backup save holo: $saved\n'
+              'Eta secret shoho — onno kauke dio na.');
+    } catch (e) {
+      setState(() => _testStatus = 'Backup korte giye vul: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// v169 — Restore: reads a backup .json, fills the form and saves.
+  Future<void> _restore() async {
+    setState(() => _busy = true);
+    try {
+      final res =
+          await FilePicker.platform.pickFiles(type: FileType.any, withData: true);
+      if (res == null || res.files.isEmpty) return;
+      final bytes = res.files.first.bytes;
+      if (bytes == null) {
+        setState(() => _testStatus = 'File-ta porte parlam na.');
+        return;
+      }
+      final map = Map<String, dynamic>.from(jsonDecode(utf8.decode(bytes)) as Map);
+      if (map['zedgeStudioBackup'] == null &&
+          map['r2WorkerUrl'] == null &&
+          map['accounts'] == null) {
+        setState(() => _testStatus = 'Eta Zedge Studio backup file na.');
+        return;
+      }
+      final cfg = DistConfig.fromJson(map);
+      await widget.engine.saveDistConfig(cfg);
+      await _load();
+      setState(() => _testStatus =
+          'Restore holo: ${cfg.accounts.length} account + R2 Worker URL.');
+    } catch (e) {
+      setState(() => _testStatus = 'Restore korte giye vul: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -206,6 +288,26 @@ class _PanelSettingsScreenState extends State<PanelSettingsScreen> {
             onPressed: _busy ? null : _save,
             icon: const Icon(Icons.save_outlined, size: 18),
             label: const Text('Save Distribution Settings'),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _busy ? null : _backup,
+                  icon: const Icon(Icons.download_outlined, size: 18),
+                  label: const Text('Backup'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: _busy ? null : _restore,
+                  icon: const Icon(Icons.upload_file_outlined, size: 18),
+                  label: const Text('Restore'),
+                ),
+              ),
+            ],
           ),
         ],
       ),

@@ -4,13 +4,20 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.media.MediaScannerConnection
 import android.os.Build
+import android.os.Environment
 import android.os.PowerManager
+import android.provider.MediaStore
 import android.provider.Settings
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -37,6 +44,30 @@ class MainActivity : FlutterActivity() {
             "com.geminihd.studio/gecko_video",
             GeckoVideoViewFactory()
         )
+        // v169 — "Save to Gallery": copies a finished MP4 into the
+        // phone's public Movies/Zedge Studio folder (MediaStore), so
+        // the Gallery / Photos app lists it.
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.geminihd.studio/media"
+        ).setMethodCallHandler { call, result ->
+            if (call.method == "saveVideo") {
+                val path = call.argument<String>("path") ?: ""
+                val name = call.argument<String>("name") ?: "zedge_animation.mp4"
+                Thread {
+                    try {
+                        val ok = saveVideoToGallery(path, name)
+                        runOnUiThread { result.success(ok) }
+                    } catch (e: Throwable) {
+                        runOnUiThread {
+                            result.error("save_failed", e.toString(), null)
+                        }
+                    }
+                }.start()
+            } else {
+                result.notImplemented()
+            }
+        }
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.geminihd.studio/browser"
@@ -177,6 +208,24 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // v166 — native cover capture (VideoCoverBridge): the
+        // panel's MediaMetadataRetriever recipe, the first cover
+        // path and the manual cover picker's frame source.
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.geminihd.studio/video_cover"
+        ).setMethodCallHandler { call, result ->
+            if (call.method == "captureCoverFrames") {
+                val path = call.argument<String>("path") ?: ""
+                val points = (call.argument<List<Any>>("pointsMs")
+                    ?: emptyList())
+                    .mapNotNull { (it as? Number)?.toLong() }
+                VideoCoverBridge.captureCoverFrames(this, path, points, result)
+            } else {
+                result.notImplemented()
+            }
+        }
+
         val geckoChannel = MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.geminihd.studio/gecko"
@@ -231,6 +280,8 @@ class MainActivity : FlutterActivity() {
                         GeckoBridge.browserVideoCancel(call.arguments as String)
                         result.success(true)
                     }
+                    "captureVideoCover" -> GeckoBridge.captureVideoCover(
+                        this, call.arguments as String, result)
                     "backendFetch" -> GeckoBridge.backendFetch(
                         this, call.arguments as String) {
                         result.success(it)
@@ -323,5 +374,56 @@ class MainActivity : FlutterActivity() {
         } catch (e: Exception) {
             false
         }
+    }
+
+    /** v169 — copies [path] into Movies/Zedge Studio (visible in the
+     *  Gallery). Android 10+ via MediaStore (no permission needed);
+     *  older phones write the public folder directly and trigger a
+     *  media scan. Returns true on success. */
+    private fun saveVideoToGallery(path: String, displayName: String): Boolean {
+        val src = File(path)
+        if (!src.exists() || src.length() == 0L) return false
+        val name = if (displayName.endsWith(".mp4", true)) displayName
+            else "$displayName.mp4"
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, name)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH,
+                    Environment.DIRECTORY_MOVIES + "/Zedge Studio")
+                put(MediaStore.Video.Media.IS_PENDING, 1)
+            }
+            val resolver = contentResolver
+            val uri = resolver.insert(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values
+            ) ?: return false
+            try {
+                resolver.openOutputStream(uri)?.use { out ->
+                    FileInputStream(src).use { it.copyTo(out) }
+                } ?: return false
+                val done = ContentValues().apply {
+                    put(MediaStore.Video.Media.IS_PENDING, 0)
+                }
+                resolver.update(uri, done, null, null)
+                return true
+            } catch (e: Throwable) {
+                try {
+                    resolver.delete(uri, null, null)
+                } catch (_: Throwable) {
+                }
+                throw e
+            }
+        }
+        val dir = File(
+            Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_MOVIES), "Zedge Studio")
+        if (!dir.exists() && !dir.mkdirs()) return false
+        val dest = File(dir, name)
+        FileInputStream(src).use { input ->
+            FileOutputStream(dest).use { out -> input.copyTo(out) }
+        }
+        MediaScannerConnection.scanFile(
+            this, arrayOf(dest.absolutePath), arrayOf("video/mp4"), null)
+        return true
     }
 }

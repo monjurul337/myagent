@@ -10,8 +10,15 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
+import androidx.lifecycle.DefaultLifecycleObserver
+import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.ProcessLifecycleOwner
+import org.mozilla.gecko.GeckoThread
 
 /**
  * Foreground service that keeps the app alive while a generation
@@ -30,6 +37,60 @@ class GenerationService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
+    // v169 — keep Gecko running with the screen off. GeckoRuntime
+    // listens to ProcessLifecycleOwner and, the moment the app is
+    // no longer in the foreground (screen off / other app), calls
+    // GeckoThread.onPause() — Gecko then runs in "application-
+    // background" mode and stops watching the network, so the
+    // headless Gemini page that renders the video stalls. While a
+    // generation runs (this service), the pause is cancelled right
+    // after it happens (GeckoThread.onResume()) and re-applied when
+    // the app comes back, so Gecko's pause counter stays balanced.
+    private val main = Handler(Looper.getMainLooper())
+    private var geckoPauseCancelled = false
+    private var lifecycleObserver: DefaultLifecycleObserver? = null
+
+    private fun registerGeckoKeepRunning() {
+        if (lifecycleObserver != null) return
+        val obs = object : DefaultLifecycleObserver {
+            override fun onPause(owner: LifecycleOwner) {
+                main.post {
+                    if (geckoPauseCancelled || !GeckoBridge.hasRuntime()) return@post
+                    try {
+                        GeckoThread.onResume()
+                        geckoPauseCancelled = true
+                        Log.i(TAG, "Gecko pause cancelled (generation running)")
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "Gecko keep-running failed: $e")
+                    }
+                }
+            }
+
+            override fun onResume(owner: LifecycleOwner) {
+                main.post { restoreGeckoPause() }
+            }
+        }
+        lifecycleObserver = obs
+        try {
+            ProcessLifecycleOwner.get().lifecycle.addObserver(obs)
+        } catch (e: Throwable) {
+            Log.w(TAG, "lifecycle observer failed: $e")
+            lifecycleObserver = null
+        }
+    }
+
+    /** Re-applies the pause we cancelled so Gecko's counter is back
+     *  to what its own lifecycle listener expects. */
+    private fun restoreGeckoPause() {
+        if (!geckoPauseCancelled) return
+        geckoPauseCancelled = false
+        try {
+            GeckoThread.onPause()
+        } catch (e: Throwable) {
+            Log.w(TAG, "Gecko pause restore failed: $e")
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -45,6 +106,7 @@ class GenerationService : Service() {
         }
         holdWakeLock()
         holdWifiLock()
+        registerGeckoKeepRunning()
         // Not sticky: the service lives only while Dart asks for
         // it; if the process dies, the service must not resurrect
         // a stale "generating" notification on its own.
@@ -52,6 +114,16 @@ class GenerationService : Service() {
     }
 
     override fun onDestroy() {
+        lifecycleObserver?.let {
+            try {
+                ProcessLifecycleOwner.get().lifecycle.removeObserver(it)
+            } catch (_: Throwable) {
+            }
+        }
+        lifecycleObserver = null
+        // The generation is over: if the app is still in the
+        // background, Gecko goes back to its normal paused state.
+        restoreGeckoPause()
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         wifiLock?.let { if (it.isHeld) it.release() }
@@ -126,6 +198,7 @@ class GenerationService : Service() {
     }
 
     companion object {
+        private const val TAG = "GenerationService"
         const val EXTRA_LABEL = "label"
         private const val DEFAULT_LABEL = "Generating in the background"
         private const val CHANNEL_ID = "generation"

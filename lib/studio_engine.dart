@@ -30,10 +30,22 @@ class StudioEngine {
   StudioEngine(
       {StatusSink? onStatus,
       http.Client? client,
-      VideoCoverCapture? coverCapture})
+      VideoCoverCapture? coverCapture,
+      VideoCoverCapture? browserCoverCapture,
+      VideoCoverCapture? chromeCoverCapture,
+      VideoCoverCapture? retrieverCoverCapture,
+      CoverCandidatesCapture? candidatesCapture})
       : onStatus = onStatus ?? ((_) {}),
         _client = client ?? http.Client(),
         _coverCapture = coverCapture ?? captureVideoCover,
+        _browserCoverCapture =
+            browserCoverCapture ?? captureVideoCoverViaBrowser,
+        _chromeCoverCapture =
+            chromeCoverCapture ?? captureVideoCoverViaChrome,
+        _retrieverCoverCapture =
+            retrieverCoverCapture ?? captureVideoCoverViaRetriever,
+        _candidatesCapture =
+            candidatesCapture ?? captureCoverCandidates,
         gemini = GeminiApi(onStatus: onStatus),
         images = ImageService(onStatus: onStatus) {
     images.cloudinary = cloudinary;
@@ -47,6 +59,29 @@ class StudioEngine {
   // v158 — the cover-frame capture seam (injected so tests can
   // fake it; the real one needs a real video file on Android).
   final VideoCoverCapture _coverCapture;
+  // v159 — the browser-canvas fallback seam: same shape as
+  // [_coverCapture], tried only when the hardware capture returns
+  // no frame. The real one runs the frame through a hidden
+  // headless Gecko session (software decode); injected so tests
+  // can fake it, and null on desktop by design.
+  final VideoCoverCapture _browserCoverCapture;
+  // v160 — the desktop cover seam: same shape as [_coverCapture],
+  // tried only when the hardware capture AND the browser-canvas
+  // fallback found no frame. The real one runs the frame through
+  // headless Chrome on Windows (the plugin has no desktop
+  // implementation and there is no Gecko bridge there); injected
+  // so tests can fake it, and null on non-Windows by design.
+  final VideoCoverCapture _chromeCoverCapture;
+  // v166 — the native retriever seam (VideoCoverBridge.kt, the
+  // panel's MediaMetadataRetriever recipe): tried FIRST, before
+  // the plugin — the panel's own submitVideo proves this API
+  // decodes Gemini's H.264 High @ 5.2 files on this phone while
+  // the plugin returns null for them. Injected so tests can
+  // fake it, and null on non-Android by design.
+  final VideoCoverCapture _retrieverCoverCapture;
+  // v166 — the manual cover picker's candidate seam (one frame
+  // per panel percentage point). Injected so tests can fake it.
+  final CoverCandidatesCapture _candidatesCapture;
 
   void _status(String state, int step, String message) =>
       onStatus(StatusEvent(state, step, message));
@@ -289,6 +324,38 @@ class StudioEngine {
     } finally {
       if (owned) client.close();
     }
+  }
+
+  /// v164 — opens ONE shared Task-backend session for a whole bulk
+  /// run (see [TaskBackendSession]): one processSession channel
+  /// (SID + gsessionid) for every line, instead of a fresh channel
+  /// per line. The caller (AnimationEngine.startBulk) runs each
+  /// line's Task inside it and closes it when the bulk ends.
+  /// Throws [TaskBackendException] naming the failed step.
+  Future<TaskBackendSession> openTaskVideoSession({
+    required DateTime deadline,
+    http.Client? httpClient,
+  }) async {
+    final session = await gemini.getSession();
+    // v125 — keep GeckoView's cookie store synced with the active
+    // account's cookies before PageBackendTransport opens the headless
+    // Gemini tab, so Charging Animation works with pasted cookies too.
+    if (GeckoSignIn.supported && session.cookieHeader.isNotEmpty) {
+      await GeckoSignIn.syncCookies(session.cookieHeader);
+    }
+    final owned = httpClient == null;
+    final client = TaskBackendClient(
+      client: httpClient ?? http.Client(),
+      session: session,
+    );
+    final backendSession = TaskBackendSession(client, ownsClient: owned);
+    try {
+      await backendSession.open(deadline: deadline);
+    } catch (e) {
+      await backendSession.close();
+      rethrow;
+    }
+    return backendSession;
   }
 
   Future<String> polishVideoPrompt(String prompt) async {
@@ -1667,15 +1734,33 @@ class StudioEngine {
   /// (Charging Animation by default). It becomes the record's
   /// contentType, which is the section the panel files it under.
   /// v158 — the returned [thumbUrl] is the cover URL when a cover
-  /// was captured and uploaded (null when the video goes without
-  /// one); the caller stores it on the video so a re-upload
-  /// reuses the same cover instead of capturing it again.
+  /// was captured and uploaded; the caller stores it on the video
+  /// so a re-upload reuses the same cover instead of capturing it
+  /// again.
+  /// v159 — [coverError] names the failed cover step (capture vs
+  /// R2 upload) when the cover failed, so the caller can write the
+  /// actual reason into the persisted error log instead of
+  /// swallowing it; null when a cover was uploaded (or a cached
+  /// one was reused).
+  /// v159 SECOND PASS — HARD GUARANTEE (user order 2026-11-22:
+  /// "ki hoy hok thumbnail jeno jay, ditiyobar jeno ar erokom na
+  /// ashe"): a missing cover now BLOCKS the queue — this method
+  /// THROWS before the Firebase record is pushed, so a record
+  /// without thumbUrl can never reach the panel again. The v158
+  /// behaviour ("upload anyway without a cover") is REVOKED.
+  /// The MP4 may already be on R2 when the cover fails (orphan
+  /// file — acceptable, the record is what matters); the video
+  /// stays on the device so the upload can be retried. [coverError]
+  /// is therefore only ever set on paths that still return (it is
+  /// kept for API compatibility); a total cover failure throws
+  /// instead of returning.
   Future<
       ({
         String accountName,
         String firebaseKey,
         SetMetadata? metadata,
         String? thumbUrl,
+        String? coverError,
       })> uploadVideoToPanel(
     AnimationVideo video, {
     String targetAccount = 'spread',
@@ -1718,14 +1803,54 @@ class StudioEngine {
 
     // v158 — cover frame for the panel card, from the local MP4.
     // A cover already stored on the video (a previous upload) is
-    // reused as-is; otherwise one frame is captured (~1s in,
-    // first frame as fallback) and uploaded beside the video.
-    // Any failure here only costs the cover — the video upload
-    // below still runs, without a thumbUrl.
-    var thumbUrl = video.thumbUrl;
-    if (thumbUrl.isEmpty) {
-      thumbUrl = await _captureAndUploadCover(
+    // reused as-is; otherwise one frame is captured (three
+    // timestamps per path, hardware first, then the browser
+    // fallback) and uploaded beside the video.
+    // v159 — when the hardware capture finds no frame, the
+    // browser-canvas fallback runs before giving up, and a cover
+    // failure is reported (not swallowed): the returned [error]
+    // names the failed step (cover capture vs cover R2 upload)
+    // plus the exception.
+    // v159 SECOND PASS — the failure is no longer "upload without
+    // a cover": a missing cover THROWS below, before the Firebase
+    // record is pushed (thumbnail guarantee — see the gate).
+    // v166 — the user's picked frame wins: capture at the picked
+    // timestamp and upload those bytes. Otherwise re-run the
+    // capture and prefer a fresh gate-passing frame over the
+    // stored thumbUrl (hatch 2: a stored black thumb must never
+    // be silently reused when a good frame is now available). A
+    // stored thumbUrl is only the last resort, when fresh capture
+    // finds no frame at all.
+    var thumbUrl = '';
+    String? coverError;
+    if (video.pickedCoverTimeMs >= 0) {
+      final picked = await _capturePickedCover(
           video, distConfig, r2Folder, baseSlug);
+      thumbUrl = picked.url;
+      coverError = picked.error;
+    }
+    if (thumbUrl.isEmpty) {
+      final cover = await _captureAndUploadCover(
+          video, distConfig, r2Folder, baseSlug);
+      thumbUrl = cover.url;
+      coverError = cover.error;
+    }
+    if (thumbUrl.isEmpty && video.thumbUrl.isNotEmpty) {
+      thumbUrl = video.thumbUrl;
+    }
+
+    // v159 SECOND PASS — HARD GUARANTEE (user order 2026-11-22:
+    // "ki hoy hok thumbnail jeno jay"): a missing cover BLOCKS
+    // the queue. The Firebase record is NEVER pushed without a
+    // thumbUrl — the v158 "upload anyway without a cover" is
+    // revoked. The MP4 may already be on R2 (orphan file,
+    // acceptable — the record is what matters); the video stays
+    // on the device so the upload can be retried.
+    if (thumbUrl.isEmpty) {
+      throw Exception(
+          'Thumbnail banano jayni — video Panel-e pathano hoyni. '
+          '${coverError ?? 'cover capture failed'}. '
+          'Video device-e ache, thumbnail thik hole abar upload korte parben.');
     }
 
     _status('downloading', 4,
@@ -1756,31 +1881,151 @@ class StudioEngine {
       firebaseKey: firebaseKey,
       metadata: meta,
       thumbUrl: thumbUrl.isEmpty ? null : thumbUrl,
+      coverError: coverError,
     );
   }
 
   /// v158 — captures one cover frame from the local MP4 (~1s in,
   /// first frame as fallback) at the video's full native
-  /// resolution and uploads it to R2 beside the video. Returns
-  /// the public URL, or '' when no cover could be made — a
-  /// missing cover must never fail the video upload, so every
-  /// failure is swallowed here with a Banglish note in the
-  /// status log (the record just goes without a thumbUrl).
-  Future<String> _captureAndUploadCover(
+  /// resolution and uploads it to R2 beside the video.
+  /// v159 — two capture paths, in order: (1) the hardware
+  /// capture ([_coverCapture], MediaMetadataRetriever — fast, and
+  /// it works for normal files); (2) when it finds no frame, the
+  /// browser-canvas fallback ([_browserCoverCapture], a hidden
+  /// headless Gecko session that software-decodes the MP4 —
+  /// live 2026-11-22 the hardware path returned null for Gemini's
+  /// H.264 High @ Level 5.2 1620x2880@60fps file on TECNO CAMON
+  /// 30S). Returns the public URL plus a null error on success.
+  /// v160 — a third path, tried last: (3) the desktop Chrome
+  /// capture ([_chromeCoverCapture], headless Chrome canvas —
+  /// the plugin has no desktop implementation and there is no
+  /// Gecko bridge on Windows, so without it the guarantee
+  /// blocked every desktop upload).
+  /// v166 — the FIRST path is now the native retriever
+  /// ([_retrieverCoverCapture], VideoCoverBridge.kt — the panel's
+  /// own MediaMetadataRetriever recipe, which decodes the same
+  /// files the plugin rejects), then hardware, browser, Chrome.
+  /// v159 SECOND PASS — three timestamps per path (1000ms, then
+  /// first frame, then 2000ms): "ki hoy hok thumbnail jeno jay".
+  /// A missing cover must now FAIL the video upload (the caller
+  /// throws before the Firebase push), so every failure still
+  /// returns url '' — but the returned [error] names the failed
+  /// step (cover capture vs cover R2 upload) plus the exception,
+  /// so the caller can write it into the persisted error log.
+  /// v162 — BRIGHTNESS GATE + longer timestamp run: a captured
+  /// BLACK frame is as useless as no frame. Live 2026-11-22 the
+  /// "Crimson Facet Tree" panel tile was BLACK — the record DID
+  /// carry a thumbUrl, but the JPEG itself was a near-black frame
+  /// (Dark Moody opens with a fade from black, and the old code
+  /// accepted the first non-empty frame without ever looking at
+  /// the pixels). Every candidate frame is now measured
+  /// ([coverFrameLuminance]) and a frame below
+  /// [kCoverMinLuminance] is rejected; timestamps per path are
+  /// 1s, 2s, 3s, 5s, then mid-video when the duration is known —
+  /// first frame at/above the threshold wins. If NO sampled frame
+  /// passes anywhere, the BRIGHTEST sampled frame is uploaded —
+  /// darkness alone never blocks the upload; the fail-closed
+  /// guarantee only fires when NO frame bytes exist at all.
+  Future<({String url, String? error})> _captureAndUploadCover(
     AnimationVideo video,
     DistConfig distConfig,
     String r2Folder,
     String baseSlug,
   ) async {
-    try {
-      Uint8List? bytes =
-          await _coverCapture(video.localPath, timeMs: 1000);
-      bytes ??= await _coverCapture(video.localPath, timeMs: 0);
-      if (bytes == null || bytes.isEmpty) {
-        _status('uploading', 3,
-            'Video-r cover banano jayni — thumbnail charai upload hocche.');
-        return '';
+    Uint8List? bytes;
+    // One note per path that threw, so the logged reason names
+    // every path that failed instead of only the first.
+    final failures = <String>[];
+    // v168 — the cover is the BEST frame between 2s and 4s of the
+    // clip (user order 2026-11-23: "2-4 second er modde jeta valo
+    // hou"): every path samples the whole 3-4s window (see
+    // coverWindowTimesMs) and the brightest sampled frame that
+    // passes the v162 gate wins — not merely the first one.
+    final coverTimesMs = coverWindowTimesMs(video.durationSec);
+    // The brightest frame sampled anywhere (all paths, all
+    // timestamps) — the fallback when no frame passes the gate.
+    Uint8List? brightestBytes;
+    var brightestLuma = -1.0;
+
+    // One path's tries: samples every timestamp in the window and
+    // returns the brightest frame at/above the brightness
+    // threshold, or null. Black frames are measured and skipped
+    // (their luma is kept for the brightest fallback), nulls are
+    // skipped, and a throw aborts only this path.
+    Future<Uint8List?> tryPath(
+      VideoCoverCapture capture,
+      String label,
+    ) async {
+      Uint8List? best;
+      var bestLuma = -1.0;
+      try {
+        for (final t in coverTimesMs) {
+          final frame = await capture(video.localPath, timeMs: t);
+          if (frame == null || frame.isEmpty) continue;
+          final luma = coverFrameLuminance(frame);
+          if (luma == null) {
+            // Unmeasurable bytes (not a decodable image): accept
+            // them rather than blocking the upload on a meter
+            // failure — the capture paths return real JPEGs in
+            // practice, so this is a bug, not a dark frame.
+            return frame;
+          }
+          if (luma > brightestLuma) {
+            brightestLuma = luma;
+            brightestBytes = frame;
+          }
+          if (luma >= kCoverMinLuminance && luma > bestLuma) {
+            bestLuma = luma;
+            best = frame;
+          }
+        }
+      } catch (e) {
+        failures.add('$label capture threw: $e');
       }
+      return best;
+    }
+
+    bytes = await tryPath(_retrieverCoverCapture, 'retriever');
+    // v159 fallback — Gecko software-decodes what the phone's
+    // hardware decoder rejects. Only runs when the fast path
+    // found no frame bright enough; the browser gets the same
+    // timestamp run.
+    bytes ??= await tryPath(_coverCapture, 'hardware');
+    bytes ??= await tryPath(_browserCoverCapture, 'browser');
+    // v160 — desktop: headless Chrome software-decodes what
+    // neither the hardware decoder nor the Gecko fallback can
+    // reach (on Android this seam returns null at once, so the
+    // order there is unchanged). Only runs when both earlier
+    // paths found no frame bright enough.
+    bytes ??= await tryPath(_chromeCoverCapture, 'chrome');
+    // v162 — no frame passed the gate anywhere, but at least one
+    // frame WAS sampled: upload the brightest of them. A dark
+    // cover is strictly better than a blocked upload, and the
+    // guarantee below still fires when no bytes exist at all.
+    bytes ??= brightestBytes;
+    if (bytes == null || bytes.isEmpty) {
+      final times = coverTimesMs.map((t) => '${t}ms').join(' + ');
+      final reason = failures.isEmpty
+          ? 'retriever + hardware + browser + chrome capture returned '
+              'no frame ($times each)'
+          : '${failures.join('; ')}; no frame from any path';
+      _status('uploading', 3,
+          'Video-r cover banano jayni — thumbnail chara record push hobe na.');
+      return (url: '', error: 'cover capture failed: $reason');
+    }
+    return _uploadCoverBytes(bytes, distConfig, r2Folder, baseSlug);
+  }
+
+  /// Uploads cover [bytes] to R2 as `<slug>_thumb.jpg` and
+  /// returns its public URL ('' + error on failure). Shared by
+  /// the auto capture and the user's picked frame.
+  Future<({String url, String? error})> _uploadCoverBytes(
+    Uint8List bytes,
+    DistConfig distConfig,
+    String r2Folder,
+    String baseSlug,
+  ) async {
+    try {
       final url = await _uploadFileToR2Worker(
         bytes: bytes,
         fileName: '${baseSlug}_thumb.jpg',
@@ -1788,11 +2033,72 @@ class StudioEngine {
         folder: r2Folder,
         fileType: 'image/jpeg',
       );
-      return url;
+      return (url: url, error: null);
     } catch (e) {
       _status('uploading', 3,
-          'Cover upload hoyni ($e) — thumbnail charai upload hocche.');
-      return '';
+          'Cover upload hoyni ($e) — thumbnail chara record push hobe na.');
+      return (url: '', error: 'cover R2 upload failed: $e');
     }
+  }
+
+  /// v166 — the user's picked cover frame: capture at exactly
+  /// the picked timestamp (retriever first, then the other
+  /// paths) and upload those bytes. NO luminance gate here —
+  /// the user SAW this frame in the picker and chose it, so a
+  /// dark pick is their choice. Returns url '' when the picked
+  /// timestamp yields no frame anywhere; the caller then falls
+  /// through to the normal capture run.
+  Future<({String url, String? error})> _capturePickedCover(
+    AnimationVideo video,
+    DistConfig distConfig,
+    String r2Folder,
+    String baseSlug,
+  ) async {
+    final t = video.pickedCoverTimeMs;
+    Uint8List? bytes;
+    final failures = <String>[];
+    for (final entry in <(VideoCoverCapture, String)>[
+      (_retrieverCoverCapture, 'retriever'),
+      (_coverCapture, 'hardware'),
+      (_browserCoverCapture, 'browser'),
+      (_chromeCoverCapture, 'chrome'),
+    ]) {
+      try {
+        final frame = await entry.$1(video.localPath, timeMs: t);
+        if (frame != null && frame.isNotEmpty) {
+          bytes = frame;
+          break;
+        }
+      } catch (e) {
+        failures.add('${entry.$2} capture threw: $e');
+      }
+    }
+    if (bytes == null || bytes.isEmpty) {
+      return (
+        url: '',
+        error: failures.isEmpty
+            ? 'picked cover (${t}ms) returned no frame'
+            : failures.join('; '),
+      );
+    }
+    return _uploadCoverBytes(bytes, distConfig, r2Folder, baseSlug);
+  }
+
+  /// v166 — candidate cover frames for the manual picker: one
+  /// frame per panel percentage point of the video's duration.
+  /// v167: returns the frames PLUS the per-path diagnostic, so
+  /// the picker can say why the frames are missing or dark.
+  /// Returns an empty result when the file is gone or nothing
+  /// could be captured anywhere.
+  Future<CoverCandidatesResult> captureCoverCandidatesFor(
+    AnimationVideo video,
+  ) async {
+    final file = File(video.localPath);
+    if (!await file.exists()) {
+      return const CoverCandidatesResult(
+          frames: [], diagnostic: 'video file nai');
+    }
+    return _candidatesCapture(video.localPath,
+        timesMs: coverCandidateTimesMs(video.durationSec));
   }
 }

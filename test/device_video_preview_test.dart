@@ -27,6 +27,8 @@ void main() {
     VideoPlayerPlatform.instance = previous;
     final f = File('/tmp/anim_v1.mp4');
     if (f.existsSync()) f.deleteSync();
+    final w = File('/tmp/anim_v1.mp4.preview.html');
+    if (w.existsSync()) w.deleteSync();
   });
 
   Future<void> pumpVideoDialog(
@@ -166,12 +168,31 @@ void main() {
     expect(find.byKey(const ValueKey('deviceVideoBrowserFallback')),
         findsOneWidget);
     expect(find.byKey(const ValueKey('fakeGeckoVideoView')), findsOneWidget);
+    // v159 second pass — the fallback loads the WRAPPER page, not
+    // the raw MP4 URL (the raw file shows Gecko's built-in media
+    // viewer with its own chrome and black bars).
     expect(seenUrl, startsWith('file://'));
-    expect(seenUrl, contains('anim_v1.mp4'));
-    // The Banglish note names the measured codec, never the raw
-    // PlatformException.
+    expect(seenUrl, endsWith('anim_v1.mp4.preview.html'));
+    // …and the wrapper file beside the MP4 really is the
+    // cover-fit page (no controls, no text on the video).
+    final wrapper = File('/tmp/anim_v1.mp4.preview.html');
+    expect(wrapper.existsSync(), isTrue);
+    final wrapperHtml = wrapper.readAsStringSync();
+    expect(wrapperHtml, contains('object-fit:cover'));
+    expect(wrapperHtml, contains('anim_v1.mp4'));
+    expect(wrapperHtml, isNot(contains('controls')));
+    // The video area is COMPLETELY CLEAN: no overlay text widget
+    // inside the fallback container at all.
+    expect(
+        find.descendant(
+            of: find.byKey(const ValueKey('deviceVideoBrowserFallback')),
+            matching: find.byType(Text)),
+        findsNothing);
     expect(find.byKey(const ValueKey('deviceVideoDecoderNote')),
-        findsOneWidget);
+        findsNothing);
+    // The Banglish note names the measured codec, never the raw
+    // PlatformException — and it lives UNDER the mockup (the hint
+    // line), not on the video.
     expect(find.textContaining('decoder'), findsOneWidget);
     expect(find.textContaining('H.264 High @ 5.1'), findsOneWidget);
     expect(find.textContaining('1620x2880'), findsOneWidget);
@@ -239,6 +260,15 @@ void main() {
     expect(find.byKey(const ValueKey('deviceVideoBrowserFallback')),
         findsOneWidget);
     expect(find.byKey(const ValueKey('fakeGeckoVideoView')), findsOneWidget);
+    // v159 second pass — the video area is clean (no overlay note)
+    // but the codec line still shows under the mockup.
+    expect(find.byKey(const ValueKey('deviceVideoDecoderNote')),
+        findsNothing);
+    expect(
+        find.descendant(
+            of: find.byKey(const ValueKey('deviceVideoBrowserFallback')),
+            matching: find.byType(Text)),
+        findsNothing);
     expect(find.textContaining('H.264 High @ 5.1'), findsOneWidget);
     expect(find.textContaining('PlatformException'), findsNothing);
     // The playing controller was released on the switch.

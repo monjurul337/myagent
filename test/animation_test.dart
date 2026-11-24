@@ -607,6 +607,7 @@ void main() {
                 firebaseKey: '-Nkey1',
                 metadata: v.metadata,
                 thumbUrl: null,
+            coverError: null,
               ));
       expect(
           await engine.uploadVideoToPanel(engine.videos.first,
@@ -646,6 +647,7 @@ void main() {
                 firebaseKey: '-N${v.id}',
                 metadata: v.metadata,
                 thumbUrl: null,
+            coverError: null,
               ));
       await engine.load();
       expect(await engine.uploadAllToPanel(), 2);
@@ -707,11 +709,16 @@ void main() {
 
     test('StudioEngine.uploadVideoToPanel posts MP4 to R2 + record',
         () async {
-      http.Request? r2Req;
+      final r2Reqs = <http.Request>[];
       http.Request? fbReq;
       final client = MockClient((req) async {
         if (req.url.host == 'worker.example.com') {
-          r2Req = req;
+          r2Reqs.add(req);
+          if (req.headers['X-File-Type'] == 'image/jpeg') {
+            return http.Response(
+                '{"url": "https://r2.example.com/zedge1/wallpaper/123_neon-blue-phone_thumb.jpg"}',
+                200);
+          }
           return http.Response(
               '{"url": "https://r2.example.com/zedge1/wallpaper/123_neon-blue-phone.mp4"}',
               200);
@@ -736,15 +743,25 @@ void main() {
           'defaultTarget': 'spread',
         }),
       });
-      final engine = StudioEngine(client: client);
+      // v159 second pass — the thumbnail guarantee: the upload
+      // now needs a real cover capture (the default returns null
+      // on this desktop host, which would block the upload).
+      final engine = StudioEngine(
+        client: client,
+        coverCapture: (path, {int timeMs = 1000}) async =>
+            Uint8List.fromList([0xFF, 0xD8, 0xFF, 0xD9]),
+      );
       final v = testVideo(metadata: fakeMeta());
       final r = await engine.uploadVideoToPanel(v);
       expect(r.accountName, 'zedge_1');
       expect(r.firebaseKey, '-Nkey1');
       expect(r.metadata?.title, 'Neon Blue Phone');
-      expect(r2Req?.headers['X-File-Type'], 'video/mp4');
-      expect(r2Req?.headers['X-File-Name'], contains('wallpaper/'));
-      expect(r2Req?.headers['X-File-Name'], endsWith('.mp4'));
+      // The MP4 went to R2 first, then the cover beside it.
+      final mp4Req = r2Reqs.firstWhere(
+          (req) => req.headers['X-File-Type'] == 'video/mp4');
+      expect(mp4Req.headers['X-File-Name'], contains('wallpaper/'));
+      expect(mp4Req.headers['X-File-Name'], endsWith('.mp4'));
+      expect(r.thumbUrl, contains('_thumb.jpg'));
       final record =
           jsonDecode(utf8.decode(fbReq!.bodyBytes)) as Map<String, dynamic>;
       expect(record['type'], 'video/mp4');
@@ -754,6 +771,9 @@ void main() {
       expect(record['tagsList'], ['neon', 'phone', 'charging']);
       expect(record['status'], 'queued');
       expect(record['prompt'], 'neon blue phone');
+      // The record carries the cover: a panel card never ships
+      // without a thumbnail (v159 second-pass guarantee).
+      expect(record['thumbUrl'], r.thumbUrl);
     });
 
     test('StudioEngine.uploadVideoToPanel throws when unconfigured',

@@ -70,6 +70,20 @@ AnimationModel animationModelById(String id) => kAnimationModels.firstWhere(
       orElse: () => kAnimationModels[2],
     );
 
+/// v159 second pass — file-size ask: the user ordered generated
+/// files to stay within 5–10 MB; the live "Copper Pine Energy
+/// Surge" clip came back 36,279,534 bytes (29 Mbps H.264). The MP4
+/// is rendered by GEMINI's encoder, not the app — the app cannot
+/// re-encode it on the phone (no ffmpeg in the app; Android
+/// MediaCodec cannot even decode these files; a browser
+/// MediaRecorder re-encode would change the format to WebM,
+/// breaking the MP4 the panel/Zedge bot expects) — so the prompt
+/// ASKS for an efficiently compressed small file. It is an ask,
+/// not a guarantee: the card measures the real size and names it
+/// when Gemini gives a bigger file (see sizeNote).
+const String kAnimationSizeAsk =
+    ', efficiently compressed small file under 10 MB, mobile-optimized H.264';
+
 /// The Zedge spec the section appends to every animation prompt
 /// (mirrors the prompt the user sent Neon himself: "1620x2880 9:16
 /// 60fps creative thought, realistic no logo"). The loop phrase
@@ -155,6 +169,16 @@ AnimationMood animationMoodById(String id) =>
 /// the default.
 const List<int> kAnimationDurations = [6, 8, 10];
 const int kDefaultAnimationDurationSec = 10;
+
+/// v159 second pass — the file-size target (user order 2026-11-22:
+/// generated files must stay within 5–10 MB; the live "Copper Pine
+/// Energy Surge" clip came back 36,279,534 bytes). Decimal MB, so
+/// the card's number matches the byte count he knows (36.3 MB for
+/// that file). The target is an ASK in the prompt (see
+/// kAnimationSizeAsk) and a NOTE on the card (see sizeNote) — the
+/// app cannot force Gemini's encoder, and size never blocks the
+/// video itself (unlike the thumbnail guarantee).
+const int kVideoTargetMaxSizeBytes = 10 * 1000 * 1000;
 
 /// v88 — seamless loop on by default (today's behaviour).
 const bool kDefaultAnimationSeamless = true;
@@ -321,11 +345,57 @@ String buildAnimationPrompt(
   } else {
     out.write(kAnimationSpecSuffix);
   }
+  // v159 second pass — the size ask rides on EVERY prompt (both
+  // branches: the size branch above skips the spec suffix, so
+  // this lives outside the if/else). Short, so it does not dilute
+  // the rest of the prompt; skipped only when the user already
+  // asked for a small file themselves.
+  if (!lower.contains('under 10 mb') && !lower.contains('10 mb')) {
+    out.write(kAnimationSizeAsk);
+  }
   if (fpsRetry) {
     out.write(', IMPORTANT: render this at 60 frames per second '
         '(60fps) — smooth high-frame-rate motion, NOT 30fps');
   }
   return out.toString();
+}
+
+/// v163 — bulk animation: one line = one animation. [parseBulkAnimationPrompts]
+/// trims each line, drops empties, drops exact duplicates (first
+/// occurrence wins, order kept). A line is one prompt — no commas,
+/// no numbering, no "1." prefixes stripped (the user types plain
+/// prompts, one per line).
+List<String> parseBulkAnimationPrompts(String raw) {
+  final seen = <String>{};
+  final out = <String>[];
+  for (final line in raw.split('\n')) {
+    final p = line.trim();
+    if (p.isEmpty) continue;
+    if (!seen.add(p)) continue;
+    out.add(p);
+  }
+  return out;
+}
+
+/// v163 — one line of a bulk animation run: its prompt, its
+/// per-line status, and the failure / skip reason when it has one.
+/// Mutable like the image QueueItem — the engine updates status in
+/// place and _emit() rebuilds the screen, so the bulk card shows
+/// queued → running → done/failed live.
+enum BulkAnimationStatus { queued, running, done, failed, skipped }
+
+class BulkAnimationItem {
+  final String id;
+  final String prompt;
+  BulkAnimationStatus status;
+  String note;
+
+  BulkAnimationItem({
+    required this.id,
+    required this.prompt,
+    this.status = BulkAnimationStatus.queued,
+    this.note = '',
+  });
 }
 
 /// One finished charging animation, stored on the device.
@@ -370,6 +440,18 @@ class AnimationVideo {
   // capturing and uploading the frame again. Empty when the
   // video has never carried a cover.
   final String thumbUrl;
+  // v166 — the user-picked cover frame: milliseconds into the
+  // video, chosen by tapping a candidate in the card's cover
+  // picker. -1 = Auto (the gate-passing frame, as before).
+  // Persisted with the video so a pick survives a restart and
+  // the next panel upload captures exactly this timestamp.
+  final int pickedCoverTimeMs;
+  // v161 — the last AI-metadata fetch for this video FAILED
+  // (auto-fetch on video-ready, or a manual tap). The video
+  // itself stays usable; the card shows the Banglish note +
+  // manual retry instead of silently having no metadata.
+  // Persisted so a restart does not hide the failure.
+  final bool metadataFailed;
   final DateTime createdAt;
   final SetMetadata? metadata;
   final Map<String, dynamic>? uploadedToPanel;
@@ -390,6 +472,8 @@ class AnimationVideo {
     this.sizeBytes = 0,
     this.panelType = kDefaultVideoPanelType,
     this.thumbUrl = '',
+    this.pickedCoverTimeMs = -1,
+    this.metadataFailed = false,
     required this.createdAt,
     this.metadata,
     this.uploadedToPanel,
@@ -404,10 +488,18 @@ class AnimationVideo {
     double? durationSec,
     int? width,
     int? height,
+    // v159 second pass — the measured file size (load() re-probes
+    // it from the file; without this the size could never be
+    // corrected after the fact).
+    int? sizeBytes,
     // v157 — the per-video panel section choice.
     String? panelType,
     // v158 — the cached panel cover URL (reused on re-upload).
     String? thumbUrl,
+    // v166 — the user-picked cover frame timestamp (ms; -1 = Auto).
+    int? pickedCoverTimeMs,
+    // v161 — the last metadata fetch failed (see field comment).
+    bool? metadataFailed,
   }) =>
       AnimationVideo(
         id: id,
@@ -422,9 +514,11 @@ class AnimationVideo {
         height: height ?? this.height,
         fps: fps ?? this.fps,
         durationSec: durationSec ?? this.durationSec,
-        sizeBytes: sizeBytes,
+        sizeBytes: sizeBytes ?? this.sizeBytes,
         panelType: panelType ?? this.panelType,
         thumbUrl: thumbUrl ?? this.thumbUrl,
+        pickedCoverTimeMs: pickedCoverTimeMs ?? this.pickedCoverTimeMs,
+        metadataFailed: metadataFailed ?? this.metadataFailed,
         createdAt: createdAt,
         metadata: metadata ?? this.metadata,
         uploadedToPanel: uploadedToPanel ?? this.uploadedToPanel,
@@ -458,18 +552,40 @@ class AnimationVideo {
   double get displayDurationSec =>
       durationSec > 0 ? durationSec : requestedDurationSec.toDouble();
 
+  /// v159 second pass — honest size note: the clip was ASKED for
+  /// under 10 MB (see kAnimationSizeAsk), but Gemini's encoder
+  /// decides — so a file over the target says so on the card
+  /// instead of the size being silently accepted. Empty when the
+  /// file is within target (or the size was never measured).
+  /// The video itself stays usable: size never blocks anything
+  /// (unlike the thumbnail guarantee).
+  bool get isOverTargetSize => sizeBytes > kVideoTargetMaxSizeBytes;
+
+  /// The measured file size in decimal MB ("36.3 MB" for the live
+  /// 36,279,534-byte file) — decimal, so the card's number matches
+  /// the byte count. Empty when the size was never measured.
+  String get sizeLabel => sizeBytes > 0
+      ? '${(sizeBytes / 1000000).toStringAsFixed(1)} MB'
+      : '';
+
+  String get sizeNote => isOverTargetSize
+      ? 'Gemini 10 MB-er boro file diyeche — $sizeLabel (10 MB chawa hoyechilo)'
+      : '';
+
   String get specLine {
     // v154 — duration = what was produced (else what was asked);
     // fps = the file's REAL fps, left out entirely when it was
     // never measured (fps 0) instead of claiming a hardcoded 60 —
     // live 2026-11-22 the file was 30fps while the card said 60fps.
+    // v159 second pass — the size is the MEASURED file size in
+    // decimal MB (36,279,534 bytes reads "36.3 MB"); the model
+    // field is set at save time (_finishBytes) and re-probed on
+    // load, so the card never shows a size that was only asked for.
     final dur = displayDurationSec > 0
         ? '${displayDurationSec.toStringAsFixed(0)}s · '
         : '';
     final fpsPart = fps > 0 ? ' · ${fps}fps' : '';
-    final size = sizeBytes > 0
-        ? ' · ${(sizeBytes / 1048576).toStringAsFixed(1)} MB'
-        : '';
+    final size = sizeLabel.isEmpty ? '' : ' · $sizeLabel';
     return '$dur${width}x$height$fpsPart$size';
   }
 
@@ -501,6 +617,8 @@ class AnimationVideo {
         'sizeBytes': sizeBytes,
         'panelType': panelType,
         'thumbUrl': thumbUrl,
+        'pickedCoverTimeMs': pickedCoverTimeMs,
+        'metadataFailed': metadataFailed,
         'createdAt': createdAt.toIso8601String(),
         if (metadata != null) 'metadata': metadata!.toJson(),
         if (uploadedToPanel != null) 'uploadedToPanel': uploadedToPanel,
@@ -538,6 +656,8 @@ class AnimationVideo {
         sizeBytes: (j['sizeBytes'] as num?)?.toInt() ?? 0,
         panelType: normalizeVideoPanelType(j['panelType']?.toString()),
         thumbUrl: (j['thumbUrl'] ?? '').toString(),
+        pickedCoverTimeMs: (j['pickedCoverTimeMs'] as num?)?.toInt() ?? -1,
+        metadataFailed: j['metadataFailed'] == true,
         createdAt: DateTime.tryParse((j['createdAt'] ?? '').toString()) ??
             DateTime.fromMillisecondsSinceEpoch(0),
         metadata: meta,
@@ -578,6 +698,8 @@ class AnimationVideoEvent {
   final int height;
   final String step;
   final String buttons;
+  // v169 — batch mode: which video of the message this is (-1 = single).
+  final int index;
 
   const AnimationVideoEvent({
     required this.action,
@@ -591,11 +713,13 @@ class AnimationVideoEvent {
     this.height = 2880,
     this.step = '',
     this.buttons = '',
+    this.index = -1,
   });
 
   bool get isVideo =>
       action == 'video_progress' ||
       action == 'video_ready' ||
+      action == 'video_batch_done' ||
       action == 'video_error';
 
   /// Parses the `data` map of a [GeckoBrowserRequest]-style event
@@ -615,6 +739,7 @@ class AnimationVideoEvent {
         height: (data['height'] as num?)?.toInt() ?? 2880,
         step: (data['step'] ?? '').toString(),
         buttons: (data['buttons'] ?? '').toString(),
+        index: (data['index'] as num?)?.toInt() ?? -1,
       );
     } catch (_) {
       return null;

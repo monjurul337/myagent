@@ -184,8 +184,8 @@ void main() {
       final r = await engine.uploadVideoToPanel(await videoFile(tmp));
       expect(r.accountName, 'zedge_1');
       expect(r.firebaseKey, '-Nkey1');
-      // First attempt is ~1s into the video.
-      expect(calls, [1000]);
+      // v168 — the whole 3-4s window is sampled, best frame wins.
+      expect(calls, kCoverWindowTimesMs);
       // The record carries the uploaded cover URL.
       expect(r.thumbUrl, isNotNull);
       expect(r.thumbUrl, contains('_thumb.jpg'));
@@ -201,8 +201,53 @@ void main() {
       expect(uploaded.height, 2880);
     });
 
-    test('capture fails (null): upload still succeeds without thumbUrl',
+    test('capture fails (null): upload is BLOCKED, no Firebase record',
         () async {
+      // v159 SECOND PASS — the thumbnail guarantee REVOKES the
+      // v158 behaviour: a missing cover now BLOCKS the queue.
+      // The upload THROWS before the Firebase record is pushed,
+      // so the panel can never get a thumbnail-less record again;
+      // the video stays on the device for a retry.
+      final tmp = Directory.systemTemp.createTempSync('v158_cover_');
+      addTearDown(() => tmp.deleteSync(recursive: true));
+      setDistConfig();
+      final r2Reqs = <http.Request>[];
+      http.Request? fbReq;
+      final client =
+          mockPanelClient(r2Reqs: r2Reqs, onFirebase: (r) => fbReq = r);
+      final hwCalls = <int>[];
+      final browserCalls = <int>[];
+      final engine = StudioEngine(
+        client: client,
+        coverCapture: (path, {int timeMs = 1000}) async {
+          hwCalls.add(timeMs);
+          return null;
+        },
+        browserCoverCapture: (path, {int timeMs = 1000}) async {
+          browserCalls.add(timeMs);
+          return null;
+        },
+      );
+      await expectLater(
+          engine.uploadVideoToPanel(await videoFile(tmp)),
+          throwsA(isA<Exception>().having((e) => '$e', 'message',
+              contains('Thumbnail banano jayni'))));
+      // No Firebase record was ever pushed…
+      expect(fbReq, isNull);
+      // …and no cover went to R2 either. Four timestamps were
+      // tried on each path before giving up.
+      expect(hwCalls, kCoverWindowTimesMs);
+      expect(browserCalls, kCoverWindowTimesMs);
+      expect(
+          r2Reqs
+              .where((req) => req.headers['X-File-Type'] == 'image/jpeg'),
+          isEmpty);
+    });
+
+    test('capture throws: upload is BLOCKED, error names the step',
+        () async {
+      // v159 SECOND PASS — same guarantee: a throwing capture
+      // blocks the queue instead of shipping without a cover.
       final tmp = Directory.systemTemp.createTempSync('v158_cover_');
       addTearDown(() => tmp.deleteSync(recursive: true));
       setDistConfig();
@@ -212,39 +257,20 @@ void main() {
           mockPanelClient(r2Reqs: r2Reqs, onFirebase: (r) => fbReq = r);
       final engine = StudioEngine(
         client: client,
-        coverCapture: (path, {int timeMs = 1000}) async => null,
-      );
-      final r = await engine.uploadVideoToPanel(await videoFile(tmp));
-      expect(r.firebaseKey, '-Nkey1');
-      expect(r.thumbUrl, isNull);
-      final record =
-          jsonDecode(utf8.decode(fbReq!.bodyBytes)) as Map<String, dynamic>;
-      expect(record.containsKey('thumbUrl'), isFalse);
-      expect(
-          r2Reqs
-              .where((req) => req.headers['X-File-Type'] == 'image/jpeg'),
-          isEmpty);
-    });
-
-    test('capture throws: upload still succeeds without thumbUrl',
-        () async {
-      final tmp = Directory.systemTemp.createTempSync('v158_cover_');
-      addTearDown(() => tmp.deleteSync(recursive: true));
-      setDistConfig();
-      final r2Reqs = <http.Request>[];
-      final client =
-          mockPanelClient(r2Reqs: r2Reqs, onFirebase: (_) {});
-      final engine = StudioEngine(
-        client: client,
         coverCapture: (path, {int timeMs = 1000}) async =>
             throw Exception('no decoder'),
+        browserCoverCapture: (path, {int timeMs = 1000}) async => null,
       );
-      final r = await engine.uploadVideoToPanel(await videoFile(tmp));
-      expect(r.firebaseKey, '-Nkey1');
-      expect(r.thumbUrl, isNull);
+      await expectLater(
+          engine.uploadVideoToPanel(await videoFile(tmp)),
+          throwsA(isA<Exception>().having((e) => '$e', 'message',
+              allOf(contains('Thumbnail banano jayni'),
+                  contains('hardware capture threw'),
+                  contains('no decoder')))));
+      expect(fbReq, isNull);
     });
 
-    test('capture fallback: 1000ms fails, first frame works', () async {
+    test('capture fallback: first window point fails, the rest work', () async {
       final tmp = Directory.systemTemp.createTempSync('v158_cover_');
       addTearDown(() => tmp.deleteSync(recursive: true));
       setDistConfig();
@@ -254,14 +280,22 @@ void main() {
       final engine = StudioEngine(
         client: client,
         coverCapture: (path, {int timeMs = 1000}) async =>
-            timeMs == 1000 ? null : cover1620(),
+            timeMs == 3000 ? null : cover1620(),
       );
       final r = await engine.uploadVideoToPanel(await videoFile(tmp));
       expect(r.thumbUrl, isNotNull);
       expect(r.thumbUrl, contains('_thumb.jpg'));
     });
 
-    test('cached thumbUrl is reused, capture never runs', () async {
+    // v166 — REVERSED: a re-upload RE-RUNS the capture and a
+    // fresh gate-passing frame beats the stored thumbUrl. The
+    // v158 rule ("cached thumbUrl is reused, capture never
+    // runs") is what let a stored BLACK thumb be re-uploaded
+    // forever (live 2026-11-23: "Charging Holiday Tree Glow").
+    // The stored URL survives only as the last resort, when
+    // fresh capture finds no frame at all (see the v166 tests).
+    test('v166: re-upload re-captures, fresh frame beats stored thumbUrl',
+        () async {
       final tmp = Directory.systemTemp.createTempSync('v158_cover_');
       addTearDown(() => tmp.deleteSync(recursive: true));
       setDistConfig();
@@ -280,35 +314,47 @@ void main() {
       final v = (await videoFile(tmp)).copyWith(
           thumbUrl: 'https://r2.example.com/zedge1/wallpaper/old_t.jpg');
       final r = await engine.uploadVideoToPanel(v);
-      expect(calls, 0);
-      expect(r.thumbUrl, 'https://r2.example.com/zedge1/wallpaper/old_t.jpg');
+      expect(calls, greaterThan(0));
+      expect(r.thumbUrl, isNotNull);
+      expect(r.thumbUrl, contains('_thumb.jpg'));
+      expect(r.thumbUrl,
+          isNot('https://r2.example.com/zedge1/wallpaper/old_t.jpg'));
       final record =
           jsonDecode(utf8.decode(fbReq!.bodyBytes)) as Map<String, dynamic>;
-      expect(record['thumbUrl'],
-          'https://r2.example.com/zedge1/wallpaper/old_t.jpg');
+      expect(record['thumbUrl'], r.thumbUrl);
       expect(
           r2Reqs
               .where((req) => req.headers['X-File-Type'] == 'image/jpeg'),
-          isEmpty);
+          isNotEmpty);
     });
 
     test('default capture skips on this platform (Windows behaviour)',
         () async {
       // The real capture only runs on Android/iOS — the plugin
       // has no desktop implementation. In flutter_test (a
-      // desktop host) it returns null, and the video upload must
-      // still succeed without a cover.
+      // desktop host) it returns null.
       expect(await captureVideoCover('/tmp/no_such_video.mp4'), isNull);
+      // v159 SECOND PASS — with no cover path at all on desktop,
+      // the thumbnail guarantee now BLOCKS the upload instead of
+      // shipping a thumbnail-less record (the v158 behaviour is
+      // revoked). v160 added the desktop cover path (headless
+      // Chrome canvas), but on this Linux test host that path
+      // returns null too (Platform.isWindows is false), so the
+      // default engine still blocks here — exactly what this
+      // test asserts.
       final tmp = Directory.systemTemp.createTempSync('v158_cover_');
       addTearDown(() => tmp.deleteSync(recursive: true));
       setDistConfig();
       final r2Reqs = <http.Request>[];
-      final client =
-          mockPanelClient(r2Reqs: r2Reqs, onFirebase: (_) {});
+      http.Request? fbReq;
+      final client = mockPanelClient(
+          r2Reqs: r2Reqs, onFirebase: (r) => fbReq = r);
       final engine = StudioEngine(client: client);
-      final r = await engine.uploadVideoToPanel(await videoFile(tmp));
-      expect(r.firebaseKey, '-Nkey1');
-      expect(r.thumbUrl, isNull);
+      await expectLater(
+          engine.uploadVideoToPanel(await videoFile(tmp)),
+          throwsA(isA<Exception>().having((e) => '$e', 'message',
+              contains('Thumbnail banano jayni'))));
+      expect(fbReq, isNull);
     });
   });
 
@@ -322,6 +368,7 @@ void main() {
           firebaseKey: '-Nk',
           metadata: null,
           thumbUrl: 'https://r2.example.com/zedge1/wallpaper/1_t.jpg',
+          coverError: null,
         ),
       );
       addTearDown(engine.dispose);
@@ -346,6 +393,7 @@ void main() {
           metadata: null,
           thumbUrl:
               'https://r2.example.com/zedge1/wallpaper/${v.id}_t.jpg',
+          coverError: null,
         ),
       );
       addTearDown(engine.dispose);

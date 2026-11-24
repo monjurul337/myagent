@@ -58,7 +58,15 @@ import 'models.dart';
 class TaskBackendException implements Exception {
   final String step;
   final String message;
-  const TaskBackendException(this.step, this.message);
+  // v164 — true when the failure killed the shared backend session
+  // itself (page transport gone, channel open failed), so the
+  // caller must open a fresh session instead of retrying on the
+  // dead one. A per-task failure (Gemini ignored the task, a poll
+  // timed out, the download failed) leaves this false — the
+  // session stays alive for the next line.
+  final bool sessionDead;
+  const TaskBackendException(this.step, this.message,
+      {this.sessionDead = false});
   @override
   String toString() => 'Task backend ($step): $message';
 }
@@ -163,17 +171,20 @@ class PageBackendTransport implements BackendTransport {
     );
     if (raw == null) {
       throw const TaskBackendException('transport',
-          'Page transport-e jukto hoyni — Gemini tab khuleni ba uttor asheni.');
+          'Page transport-e jukto hoyni — Gemini tab khuleni ba uttor asheni.',
+          sessionDead: true);
     }
     Map m;
     try {
       m = jsonDecode(raw) as Map;
     } catch (_) {
       throw const TaskBackendException(
-          'transport', 'Page transport theke bujha jayna uttor aslo.');
+          'transport', 'Page transport theke bujha jayna uttor aslo.',
+          sessionDead: true);
     }
     if (m['error'] != null) {
-      throw TaskBackendException('transport', '${m['error']}');
+      throw TaskBackendException('transport', '${m['error']}',
+          sessionDead: true);
     }
     final data = m['data'] as String? ?? '';
     final b64 =
@@ -183,7 +194,8 @@ class PageBackendTransport implements BackendTransport {
       bytes = base64Decode(b64);
     } catch (_) {
       throw const TaskBackendException(
-          'transport', 'Page transport-er uttor base64 na.');
+          'transport', 'Page transport-er uttor base64 na.',
+          sessionDead: true);
     }
     return BackendResponse(m['status'] as int? ?? 0, bytes);
   }
@@ -572,6 +584,16 @@ class TaskBackendClient {
     return m?.group(1);
   }
 
+  /// v164 — the SAPISID cookie must be present before any channel
+  /// work (shared by the single run and the shared session open).
+  void _requireSapisid() {
+    _sapisid = _cookieValue('SAPISID');
+    if (_sapisid == null || _sapisid!.isEmpty) {
+      throw const TaskBackendException(
+          'auth', 'SAPISID cookie pelam na — Login tab-e abar sign in koro.');
+    }
+  }
+
   /// Runs the whole backend flow and returns the finished MP4 bytes.
   /// Throws [TaskBackendException] naming the failed step; the caller
   /// (AnimationEngine) falls back to the browser driver.
@@ -585,11 +607,7 @@ class TaskBackendClient {
     required void Function(String phase, String message) onPhase,
     required DateTime deadline,
   }) async {
-    _sapisid = _cookieValue('SAPISID');
-    if (_sapisid == null || _sapisid!.isEmpty) {
-      throw const TaskBackendException(
-          'auth', 'SAPISID cookie pelam na — Login tab-e abar sign in koro.');
-    }
+    _requireSapisid();
     // v140 — page transport FIRST (v98 behaviour, restored): the
     // requests run inside the signed-in Gemini page, so Google sees
     // a real browser, not a bot. v137 ran the whole flow on raw Dart
@@ -604,61 +622,33 @@ class TaskBackendClient {
     // v142 — the stream GET runs on the page too: the 20:47 live
     // test proved the raw-HTTP stream never delivers a c_... id.
     try {
-      return await _runFlow(_pageTransport, taskText,
+      return await _runOnTransport(_pageTransport, taskText,
           onPhase: onPhase, deadline: deadline);
     } on TaskBackendException catch (e) {
       if (e.step != 'transport') rethrow;
       onPhase('opening', 'Page transport hoyni — Dart diye chesta…');
-      return await _runFlow(_httpTransport, taskText,
+      return await _runOnTransport(_httpTransport, taskText,
           onPhase: onPhase, deadline: deadline);
     }
   }
 
-  Future<Uint8List> _runFlow(
+  /// v164 — one task on one transport, inside a session that opens
+  /// a fresh channel for it and closes it after. Single jobs keep
+  /// this exact behaviour; a bulk run opens the session once and
+  /// calls [TaskBackendSession.runTask] per line instead.
+  Future<Uint8List> _runOnTransport(
     BackendTransport transport,
     String taskText, {
     required void Function(String phase, String message) onPhase,
     required DateTime deadline,
   }) async {
-    _workingApiKey = _geminiWebPaApiKey;
-    onPhase('opening', 'Gemini Task channel khulche…');
-    final opened = await _openChannelDirect(transport);
-    final sid = opened.sid;
-    var gsessionid = opened.gsessionid;
-    if (gsessionid.isEmpty) {
-      // Fallback for unit-test mocks that expect chooseServer.
-      gsessionid = await _chooseServer(transport);
-    }
-    // v137 (HAR #224 -> #225 -> #229): start long-poll stream, then send
-    // setup (ofs=0) and task (ofs=1) IMMEDIATELY before awaiting c_...
-    // (Gemini creates c_... in response to setup + task).
-    // v142 — the stream runs on the SAME transport as the POSTs: the
-    // 20:47 live test proved the channel/setup/task POSTs succeed via
-    // the page while the raw-HTTP stream never delivered a c_... id
-    // in 10 min (Google bot-checks raw Dart HTTP — chooseServer 403
-    // + /u/0/app bot-check, 2026-11-21). The page fetch carries the
-    // live browser cookies, so a stale Dart-side jar can't starve
-    // the stream either.
-    final stream = _ChannelStream(transport, sid, gsessionid, _cookieHeader, initialRid: opened.rid);
-    unawaited(stream.run(deadline));
+    final session = TaskBackendSession(this);
+    await session.openOn(transport, deadline: deadline);
     try {
-      onPhase('opening', 'Task pathacche…');
-      await _sendSetup(transport, sid, gsessionid, stream);
-      await _sendTask(transport, sid, gsessionid, stream, taskText);
-      onPhase('creating', 'Task thread toiri hocche…');
-      final conversationId = await stream.conversationId.timeout(
-          submitTimeout,
-          onTimeout: () => throw TaskBackendException(
-              'channel',
-              'Conversation id asheni — channel khuleche kintu Gemini '
-              'kono task thread banayni. (stream: ${stream.polls} poll, '
-              'sesh HTTP ${stream.lastStatus ?? '-'}, ${stream.lastBytes} byte.)'));
-      onPhase('creating', 'Backend-e video banacche…');
-      final url = await _pollForVideo(transport, conversationId, onPhase, deadline);
-      onPhase('downloading', 'MP4 download hocche…');
-      return await _download(transport, url);
+      return await session.runTask(taskText,
+          onPhase: onPhase, deadline: deadline);
     } finally {
-      stream.stop();
+      await session.close();
     }
   }
 
@@ -762,7 +752,8 @@ class TaskBackendClient {
         res = await reqFuture.timeout(const Duration(seconds: 20));
       } on TimeoutException {
         throw const TaskBackendException(
-            'transport', 'Page transport time out — Dart HTTP diye chesta.');
+            'transport', 'Page transport time out — Dart HTTP diye chesta.',
+            sessionDead: true);
       }
     } else {
       res = await reqFuture;
@@ -823,12 +814,14 @@ class TaskBackendClient {
         method: 'POST', uri: uri, headers: _formHeaders(), body: 'count=0');
     if (res.status != 200) {
       throw TaskBackendException(
-          'channel', 'Channel khola jayni: HTTP ${res.status}.');
+          'channel', 'Channel khola jayni: HTTP ${res.status}.',
+          sessionDead: true);
     }
     final sid = parseChannelOpen(res.text);
     if (sid == null) {
       throw const TaskBackendException(
-          'channel', 'Channel khullo kintu session id pelam na.');
+          'channel', 'Channel khullo kintu session id pelam na.',
+          sessionDead: true);
     }
     final gs = res.header('x-http-session-id') ?? '';
     return (sid: sid, gsessionid: gs, rid: rid);
@@ -848,10 +841,11 @@ class TaskBackendClient {
   }
 
   Future<void> _sendSetup(BackendTransport transport, String sid,
-      String gsessionid, _ChannelStream stream) async {
+      String gsessionid, _ChannelStream stream,
+      {int ofs = 0}) async {
     final uuid = _uuid();
     final body =
-        'count=1&ofs=0&req0___data__=${Uri.encodeQueryComponent(base64.encode(buildSetupMessage(uuid)))}';
+        'count=1&ofs=$ofs&req0___data__=${Uri.encodeQueryComponent(base64.encode(buildSetupMessage(uuid)))}';
     final res = await transport
         .fetch(
             method: 'POST',
@@ -865,9 +859,10 @@ class TaskBackendClient {
   }
 
   Future<void> _sendTask(BackendTransport transport, String sid,
-      String gsessionid, _ChannelStream stream, String taskText) async {
+      String gsessionid, _ChannelStream stream, String taskText,
+      {int ofs = 1}) async {
     final body =
-        'count=1&ofs=1&req0___data__=${Uri.encodeQueryComponent(base64.encode(buildTaskMessage(taskText)))}';
+        'count=1&ofs=$ofs&req0___data__=${Uri.encodeQueryComponent(base64.encode(buildTaskMessage(taskText)))}';
     final res = await transport
         .fetch(
             method: 'POST',
@@ -964,6 +959,167 @@ class TaskBackendClient {
   }
 }
 
+// ---------------------------------------------------------------------
+// v164 — ONE shared backend session for a whole bulk run.
+// ---------------------------------------------------------------------
+
+/// v164 — what the engine holds for a bulk run: one open backend
+/// session that many tasks can run inside. The real implementation
+/// is [TaskBackendSession]; tests inject fakes of this interface.
+abstract class SharedBackendSession {
+  /// Runs one Task video generation inside this session and returns
+  /// the finished MP4 bytes. Throws [TaskBackendException] naming
+  /// the failed step; when [TaskBackendException.sessionDead] is
+  /// true the session itself is dead and the caller must open a
+  /// fresh one.
+  Future<Uint8List> runTask(
+    String taskText, {
+    required void Function(String phase, String message) onPhase,
+    required DateTime deadline,
+  });
+
+  /// Stops the channel stream (and the owned HTTP client, when
+  /// this session owns it). Safe to call twice.
+  Future<void> close();
+
+  /// True while the channel is open.
+  bool get isOpen;
+}
+
+/// v164 — one processSession channel (SID + gsessionid) + one
+/// long-poll stream, shared by every task of a bulk run. Each task
+/// is still its OWN Task (its own setup + task messages, its own
+/// conversation c_... — one task = one video is Gemini's rule),
+/// but the channel open happens ONCE: the messages ride on the
+/// same channel with incrementing offsets (setup ofs=0, task ofs=1,
+/// setup ofs=2, task ofs=3, ...) instead of a fresh channel per
+/// line. A per-task failure never closes the session — the next
+/// line reuses it; only a session-dead failure ([TaskBackendException.
+/// sessionDead]: page transport gone, channel open failed) marks
+/// it dead, and the caller re-opens once.
+/// The setup+task pair per line is kept exactly as the HAR-verified
+/// flow sends it (setup immediately before its task, fresh uuid):
+/// the channel is what is shared, not the setup — no captured HAR
+/// shows a bare second task without its setup, so none is invented.
+class TaskBackendSession implements SharedBackendSession {
+  TaskBackendSession(this._client, {this.ownsClient = false});
+
+  final TaskBackendClient _client;
+
+  /// True when this session owns the client's HTTP client (the
+  /// StudioEngine opener created it): [close] closes it. A session
+  /// built inside [TaskBackendClient.run] never owns it — the
+  /// caller closes it.
+  final bool ownsClient;
+
+  BackendTransport? _transport;
+  String? _sid;
+  String _gsessionid = '';
+  _ChannelStream? _stream;
+  int _nextOfs = 0;
+  bool _open = false;
+
+  @override
+  bool get isOpen => _open;
+
+  /// Opens the channel on the page transport first, Dart HTTP on a
+  /// transport failure (same fallback as [TaskBackendClient.run]).
+  /// The stream runs until [deadline] or [close].
+  Future<void> open({required DateTime deadline}) async {
+    if (_open) return;
+    _client._requireSapisid();
+    try {
+      await openOn(_client._pageTransport, deadline: deadline);
+    } on TaskBackendException catch (e) {
+      if (e.step != 'transport') rethrow;
+      await openOn(_client._httpTransport, deadline: deadline);
+    }
+  }
+
+  /// Opens the channel on one transport (no fallback). Used by
+  /// [open] and by [TaskBackendClient.run]'s per-transport flow.
+  Future<void> openOn(BackendTransport transport,
+      {required DateTime deadline}) async {
+    if (_open) return;
+    _client._workingApiKey = TaskBackendClient._geminiWebPaApiKey;
+    final opened = await _client._openChannelDirect(transport);
+    var gsessionid = opened.gsessionid;
+    if (gsessionid.isEmpty) {
+      // Fallback for unit-test mocks that expect chooseServer.
+      gsessionid = await _client._chooseServer(transport);
+    }
+    final stream = _ChannelStream(transport, opened.sid, gsessionid,
+        _client._cookieHeader,
+        initialRid: opened.rid);
+    _transport = transport;
+    _sid = opened.sid;
+    _gsessionid = gsessionid;
+    _stream = stream;
+    _nextOfs = 0;
+    _open = true;
+    unawaited(stream.run(deadline));
+  }
+
+  @override
+  Future<Uint8List> runTask(
+    String taskText, {
+    required void Function(String phase, String message) onPhase,
+    required DateTime deadline,
+  }) async {
+    if (!_open || _stream == null || _sid == null || _transport == null) {
+      throw const TaskBackendException(
+          'channel', 'Backend session khola nei — age open() koro.',
+          sessionDead: true);
+    }
+    final transport = _transport!;
+    final stream = _stream!;
+    final sid = _sid!;
+    // The conversations this session already made: the stream must
+    // deliver a NEW one for this task, never an old one again.
+    final seenBefore = Set<String>.of(stream.seenConversations);
+    try {
+      onPhase('opening', 'Task pathacche…');
+      await _client._sendSetup(transport, sid, _gsessionid, stream,
+          ofs: _nextOfs++);
+      await _client._sendTask(transport, sid, _gsessionid, stream, taskText,
+          ofs: _nextOfs++);
+      onPhase('creating', 'Task thread toiri hocche…');
+      final conversationId = await stream
+          .waitForNextConversationId(exclude: seenBefore)
+          .timeout(
+              _client.submitTimeout,
+              onTimeout: () => throw TaskBackendException(
+                  'channel',
+                  'Conversation id asheni — channel khuleche kintu Gemini '
+                  'kono task thread banayni. (stream: ${stream.polls} poll, '
+                  'sesh HTTP ${stream.lastStatus ?? '-'}, ${stream.lastBytes} byte.)'));
+      onPhase('creating', 'Backend-e video banacche…');
+      final url = await _client._pollForVideo(
+          transport, conversationId, onPhase, deadline);
+      onPhase('downloading', 'MP4 download hocche…');
+      return await _client._download(transport, url);
+    } on TaskBackendException catch (e) {
+      // A dead session is marked once, here: the next line must
+      // not retry on it. A per-task failure (sessionDead false —
+      // Gemini ignored this task, a poll failed) leaves the
+      // session open for the next line.
+      if (e.sessionDead) {
+        _open = false;
+        _stream?.stop();
+      }
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    _stream?.stop();
+    _stream = null;
+    _open = false;
+    if (ownsClient) _client.close();
+  }
+}
+
 /// The processSession long-poll: reads the chunked stream
 /// (`<len>\n[[n,["<base64>"]]]\n`) and exposes the conversation id
 /// as soon as it arrives. Re-opens the GET with AID=<last index>
@@ -996,11 +1152,67 @@ class _ChannelStream {
   int? lastStatus;
   int lastBytes = 0;
 
-  final _conversationIdCompleter = Completer<String>();
-  Future<String> get conversationId => _conversationIdCompleter.future;
+  /// v164 — every conversation this stream has delivered so far,
+  /// in arrival order. A shared session waits for the NEXT id
+  /// (one not seen before its task started), never an old one.
+  final Set<String> _seenConversations = {};
+  Set<String> get seenConversations =>
+      Set<String>.unmodifiable(_seenConversations);
+
+  /// v164 — tasks waiting for their conversation id. Each waiter
+  /// excludes the ids that already existed when its task started,
+  /// so two tasks sharing one stream can never be handed the same
+  /// conversation.
+  final List<({Set<String> exclude, Completer<String> completer})>
+      _waiters = [];
+
+  /// v164 — the next conversation id this stream delivers that is
+  /// not in [exclude]. Returns at once when such an id already
+  /// arrived; otherwise waits for the next poll that carries one.
+  /// Fails fast when the stream stops or dies.
+  Future<String> waitForNextConversationId(
+      {Set<String> exclude = const {}}) {
+    for (final id in _seenConversations) {
+      if (!exclude.contains(id)) return Future.value(id);
+    }
+    if (_stopped) {
+      return Future.error(const TaskBackendException('transport',
+          'Backend session bondho hoye geche.',
+          sessionDead: true));
+    }
+    final completer = Completer<String>();
+    _waiters.add((exclude: exclude, completer: completer));
+    return completer.future;
+  }
+
+  void _offerConversationId(String id) {
+    if (!_seenConversations.add(id)) return;
+    for (var i = 0; i < _waiters.length; i++) {
+      final waiter = _waiters[i];
+      if (!waiter.exclude.contains(id) &&
+          !waiter.completer.isCompleted) {
+        _waiters.removeAt(i);
+        waiter.completer.complete(id);
+        return;
+      }
+    }
+  }
+
+  void _failWaiters(Object error) {
+    for (final waiter in _waiters) {
+      if (!waiter.completer.isCompleted) {
+        waiter.completer.completeError(error);
+      }
+    }
+    _waiters.clear();
+  }
 
   void stop() {
+    if (_stopped) return;
     _stopped = true;
+    _failWaiters(const TaskBackendException('transport',
+        'Backend session bondho hoye geche.',
+        sessionDead: true));
   }
 
   void nextRid() {
@@ -1020,9 +1232,8 @@ class _ChannelStream {
         // Fail the id wait after 2 in a row so run() falls back to
         // Dart HTTP instead of spinning until the submit timeout.
         if (e is TaskBackendException && e.step == 'transport') {
-          if (++transportFailures >= 2 &&
-              !_conversationIdCompleter.isCompleted) {
-            _conversationIdCompleter.completeError(e);
+          if (++transportFailures >= 2) {
+            _failWaiters(e);
             return;
           }
         } else {
@@ -1031,7 +1242,7 @@ class _ChannelStream {
         await Future.delayed(const Duration(seconds: 2));
       }
       if (_stopped) return;
-      if (_conversationIdCompleter.isCompleted) {
+      if (_seenConversations.isNotEmpty) {
         await Future.delayed(const Duration(seconds: 5));
       } else {
         // v142 — a poll that answers instantly (a 403/blocked stream,
@@ -1094,11 +1305,8 @@ class _ChannelStream {
       final idx = int.tryParse(m.group(1)!);
       if (idx != null && idx > lastMsgIndex) lastMsgIndex = idx;
     }
-    if (!_conversationIdCompleter.isCompleted) {
-      final ids = extractStreamIds(buffer);
-      if (ids.conversations.isNotEmpty) {
-        _conversationIdCompleter.complete(ids.conversations.first);
-      }
+    for (final id in extractStreamIds(buffer).conversations) {
+      _offerConversationId(id);
     }
   }
 }

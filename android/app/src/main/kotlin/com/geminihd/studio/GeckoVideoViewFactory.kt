@@ -26,9 +26,17 @@ import org.mozilla.geckoview.GeckoView
  * One FRESH GeckoSession per view, on the shared GeckoRuntime
  * (same settings as GeckoBridge.browserSession) — never the shared
  * browser tab session, so this view cannot steal or disturb the
- * Gemini tab. The session is closed with the view. The view loads
- * the local MP4 URL directly; Gecko's built-in video viewer plays
- * it with its own controls.
+ * Gemini tab. The session is closed with the view.
+ *
+ * v159 second pass — the URL this view loads is the WRAPPER page
+ * (lib/widgets/video_preview_wrapper.dart: a minimal HTML page
+ * with a cover-fit <video>, written next to the MP4 and handed
+ * over as its file:// URL), NOT the raw MP4 URL: loading the raw
+ * file showed Gecko's built-in media viewer with its own chrome
+ * and a contain-fit with black bars instead of filling the mockup
+ * screen. The factory itself stays generic — it loads whatever
+ * URL it is given; the raw MP4 URL only arrives when the wrapper
+ * could not be written (old behaviour, kept as the fallback).
  *
  * Registered in MainActivity.configureFlutterEngine as
  * "com.geminihd.studio/gecko_video".

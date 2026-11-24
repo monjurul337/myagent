@@ -95,7 +95,10 @@ const String windowsVideoDriverScript = r'''
   };
   // v90: is Gemini Task mode on? The selected pill (aria-pressed /
   // selected / active class) or the composer placeholder saying
-  // "Describe a task" (Chat mode says "Ask Gemini").
+  // "Describe a task" (Chat mode says "Ask Gemini"). v165: on a
+  // finished task thread the composer shows a mode-picker dropdown
+  // instead of pills ("Open mode picker, currently …") — when its
+  // label says Task, Task mode is on.
   function taskModeOn() {
     try {
       const pill = findBtnExact('Task');
@@ -104,12 +107,70 @@ const String windowsVideoDriverScript = r'''
         if (/true/i.test(ap)) return true;
         if (/(selected|active|checked)/i.test((pill.className || '').toString())) return true;
       }
+      const picker = findBtn(['mode picker']);
+      if (picker && /currently\s+task/i.test(textOf(picker))) return true;
       const eds = [...document.querySelectorAll('div[contenteditable="true"], textarea')].filter(visible);
       return eds.some((el) => {
         const ph = (el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('data-placeholder') || '') + ' ' + (el.getAttribute('aria-label') || '');
         return /task/i.test(ph);
       });
     } catch (e) { return false; }
+  }
+  // v165 — pick Task out of the composer's mode-picker dropdown
+  // (finished task thread: "Open mode picker, currently Gemini…",
+  // no Chat | Task pills). Same option hunt as ensureModel: open
+  // the menu, take the short "Task" option, wait for Task mode to
+  // show. Strict: unlike the pill click below, an unverified menu
+  // pick is NOT trusted — the caller falls through to New Chat.
+  async function pickTaskFromModePicker() {
+    try {
+      const picker = findBtn(['mode picker']);
+      if (!picker) return false;
+      picker.click();
+      let opt = null;
+      const end = Date.now() + 4000;
+      while (Date.now() < end && !opt) {
+        await sleep(300);
+        opt = [...document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], [role="radio"], li, button, [role="button"]')]
+          .filter(visible)
+          .filter((el) => el !== picker && !picker.contains(el) && !el.contains(picker))
+          .find((el) => {
+            const t = norm((el.textContent || '').replace(/\s+/g, ' ').trim());
+            return t.length > 0 && t.length <= 120 && (t === 'task' || /^task[\s—-]/.test(t));
+          }) || null;
+      }
+      if (!opt) { try { picker.click(); } catch (e) {} return false; }
+      opt.click();
+      const end2 = Date.now() + 10000;
+      while (Date.now() < end2) {
+        if (taskModeOn()) return true;
+        await sleep(500);
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+  // v165 — one attempt on the current page: the Chat | Task pill,
+  // then the mode-picker menu. Gives the composer a moment to
+  // rebuild after the previous task (slow network) before
+  // declaring either absent. No navigation here.
+  async function ensureTaskModeOnce() {
+    if (taskModeOn()) return true;
+    const settleEnd = Date.now() + 4000;
+    while (Date.now() < settleEnd) {
+      if (findBtnExact('Task') || findBtn(['mode picker'])) break;
+      await sleep(500);
+    }
+    const pill = findBtnExact('Task');
+    if (pill) {
+      pill.click();
+      const end = Date.now() + 10000;
+      while (Date.now() < end) {
+        if (taskModeOn()) return true;
+        await sleep(500);
+      }
+      return true;
+    }
+    return await pickTaskFromModePicker();
   }
   // v90: make sure Task mode is on. Returns true when on (or when
   // the Task pill was clicked — a segmented control does not no-op
@@ -119,19 +180,32 @@ const String windowsVideoDriverScript = r'''
   // is MANDATORY (user order 2026-11-20, "must task mode lagbe") —
   // the caller fails the job when this returns false; there is no
   // Chat fallback anymore (a Task prompt in a Chat composer gets a
-  // plain-chat image answer, not a video).
+  // plain-chat image answer, not a video). v165 (live 2026-11-23
+  // 00:13): bulk line 2 failed "__notask__" — the driver reuses
+  // one headless tab, and on the finished task thread the composer
+  // has a mode picker and no Task pill, so the old one-shot pill
+  // lookup failed. Now: pill, then the mode-picker menu, then a
+  // fresh chat ("New Chat" — each bulk line is its own task thread
+  // anyway) and one more try on the fresh composer. Only when all
+  // of that fails does the job report task_mode with the picker's
+  // actual contents in the button dump.
   async function ensureTaskMode() {
     try {
       if (taskModeOn()) return true;
-      const pill = findBtnExact('Task');
-      if (!pill) return false;
-      pill.click();
-      const end = Date.now() + 10000;
+      if (await ensureTaskModeOnce()) return true;
+      const newChat = findBtn(['New Chat']);
+      if (!newChat) return false;
+      newChat.click();
+      await sleep(2500);
+      const end = Date.now() + 20000;
       while (Date.now() < end) {
-        if (taskModeOn()) return true;
+        const eds = [...document.querySelectorAll('div[contenteditable="true"], textarea')].filter(visible);
+        if (eds.length) break;
         await sleep(500);
       }
-      return true;
+      await sleep(1500);
+      if (taskModeOn()) return true;
+      return await ensureTaskModeOnce();
     } catch (e) { return false; }
   }
   // v151 — model picker. The Gemini composer has a model chip on the

@@ -27,7 +27,11 @@ void main() {
         await File('lib/animation_screen.dart').readAsString();
     expect(anim, contains('BorderRadius.circular(20)'));
     expect(anim, contains("'\${_promptCtrl.text.length}/16384'"));
-    expect(anim, contains("const Text('Generate animation')"));
+    // v163 — the label is dynamic now (one line = 'Generate
+    // animation', several lines = 'Generate N animations'), but
+    // the single-line label and the 56px button are unchanged.
+    expect(anim, contains("'Generate animation'"));
+    expect(anim, contains("'Generate \${bulkLines.length} animations'"));
     expect(anim, contains('minimumSize: const Size.fromHeight(56)'));
   });
 

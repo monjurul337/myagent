@@ -97,10 +97,14 @@ void main() {
     expect(
         find.text('A blazing fire ring charges the phone with neon sparks.'),
         findsOneWidget);
-    // v157 — 'Live Wallpaper' now appears twice on the list card:
-    // the metadata category pill AND the panel-type chip.
-    expect(find.text('Live Wallpaper'), findsNWidgets(2));
-    expect(find.text('charging'), findsOneWidget);
+    // v159 second pass — the list card mirrors the image card:
+    // the category pill is the filled purple UPPERCASE pill
+    // ('LIVE WALLPAPER'), while the panel-type chip still reads
+    // 'Live Wallpaper' — one of each now, not two of the latter.
+    expect(find.text('LIVE WALLPAPER'), findsOneWidget);
+    expect(find.text('Live Wallpaper'), findsOneWidget);
+    // v159 second pass — tags use the image card's '#tag' chip.
+    expect(find.text('#charging'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

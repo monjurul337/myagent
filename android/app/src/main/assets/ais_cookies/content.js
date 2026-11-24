@@ -839,7 +839,10 @@ window.__aisTouchUI = true;
   };
   // v90: is Gemini Task mode on? The selected pill (aria-pressed /
   // selected / active class) or the composer placeholder saying
-  // "Describe a task" (Chat mode says "Ask Gemini").
+  // "Describe a task" (Chat mode says "Ask Gemini"). v165: on a
+  // finished task thread the composer shows a mode-picker dropdown
+  // instead of pills ("Open mode picker, currently …") — when its
+  // label says Task, Task mode is on.
   function taskModeOn() {
     try {
       const pill = findBtnExact('Task');
@@ -848,12 +851,70 @@ window.__aisTouchUI = true;
         if (/true/i.test(ap)) return true;
         if (/(selected|active|checked)/i.test((pill.className || '').toString())) return true;
       }
+      const picker = findBtn(['mode picker']);
+      if (picker && /currently\s+task/i.test(textOf(picker))) return true;
       const eds = [...document.querySelectorAll('div[contenteditable="true"], textarea')].filter(visible);
       return eds.some((el) => {
         const ph = (el.getAttribute('placeholder') || '') + ' ' + (el.getAttribute('data-placeholder') || '') + ' ' + (el.getAttribute('aria-label') || '');
         return /task/i.test(ph);
       });
     } catch (e) { return false; }
+  }
+  // v165 — pick Task out of the composer's mode-picker dropdown
+  // (finished task thread: "Open mode picker, currently Gemini…",
+  // no Chat | Task pills). Same option hunt as ensureModel: open
+  // the menu, take the short "Task" option, wait for Task mode to
+  // show. Strict: unlike the pill click below, an unverified menu
+  // pick is NOT trusted — the caller falls through to New Chat.
+  async function pickTaskFromModePicker() {
+    try {
+      const picker = findBtn(['mode picker']);
+      if (!picker) return false;
+      picker.click();
+      let opt = null;
+      const end = Date.now() + 4000;
+      while (Date.now() < end && !opt) {
+        await sleep(300);
+        opt = [...document.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], [role="radio"], li, button, [role="button"]')]
+          .filter(visible)
+          .filter((el) => el !== picker && !picker.contains(el) && !el.contains(picker))
+          .find((el) => {
+            const t = norm((el.textContent || '').replace(/\s+/g, ' ').trim());
+            return t.length > 0 && t.length <= 120 && (t === 'task' || /^task[\s—-]/.test(t));
+          }) || null;
+      }
+      if (!opt) { try { picker.click(); } catch (e) {} return false; }
+      opt.click();
+      const end2 = Date.now() + 10000;
+      while (Date.now() < end2) {
+        if (taskModeOn()) return true;
+        await sleep(500);
+      }
+      return false;
+    } catch (e) { return false; }
+  }
+  // v165 — one attempt on the current page: the Chat | Task pill,
+  // then the mode-picker menu. Gives the composer a moment to
+  // rebuild after the previous task (slow network) before
+  // declaring either absent. No navigation here.
+  async function ensureTaskModeOnce() {
+    if (taskModeOn()) return true;
+    const settleEnd = Date.now() + 4000;
+    while (Date.now() < settleEnd) {
+      if (findBtnExact('Task') || findBtn(['mode picker'])) break;
+      await sleep(500);
+    }
+    const pill = findBtnExact('Task');
+    if (pill) {
+      pill.click();
+      const end = Date.now() + 10000;
+      while (Date.now() < end) {
+        if (taskModeOn()) return true;
+        await sleep(500);
+      }
+      return true;
+    }
+    return await pickTaskFromModePicker();
   }
   // v90: make sure Task mode is on. Returns true when on (or when
   // the Task pill was clicked — a segmented control does not no-op
@@ -863,19 +924,32 @@ window.__aisTouchUI = true;
   // is MANDATORY (user order 2026-11-20, "must task mode lagbe") —
   // the caller fails the job when this returns false; there is no
   // Chat fallback anymore (a Task prompt in a Chat composer gets a
-  // plain-chat image answer, not a video).
+  // plain-chat image answer, not a video). v165 (live 2026-11-23
+  // 00:13): bulk line 2 failed "__notask__" — the driver reuses
+  // one headless tab, and on the finished task thread the composer
+  // has a mode picker and no Task pill, so the old one-shot pill
+  // lookup failed. Now: pill, then the mode-picker menu, then a
+  // fresh chat ("New Chat" — each bulk line is its own task thread
+  // anyway) and one more try on the fresh composer. Only when all
+  // of that fails does the job report task_mode with the picker's
+  // actual contents in the button dump.
   async function ensureTaskMode() {
     try {
       if (taskModeOn()) return true;
-      const pill = findBtnExact('Task');
-      if (!pill) return false;
-      pill.click();
-      const end = Date.now() + 10000;
+      if (await ensureTaskModeOnce()) return true;
+      const newChat = findBtn(['New Chat']);
+      if (!newChat) return false;
+      newChat.click();
+      await sleep(2500);
+      const end = Date.now() + 20000;
       while (Date.now() < end) {
-        if (taskModeOn()) return true;
+        const eds = [...document.querySelectorAll('div[contenteditable="true"], textarea')].filter(visible);
+        if (eds.length) break;
         await sleep(500);
       }
-      return true;
+      await sleep(1500);
+      if (taskModeOn()) return true;
+      return await ensureTaskModeOnce();
     } catch (e) { return false; }
   }
   // v151 — model picker. The Gemini composer has a model chip on the
@@ -979,6 +1053,10 @@ window.__aisTouchUI = true;
     const jobId = (m.jobId || '').toString();
     const prompt = (m.prompt || '').toString();
     const model = (m.model || 'neon').toString();
+    // v169 — batch mode: ONE message asks for several videos; the
+    // driver then collects up to [wantCount] of them (default 1 =
+    // the old single-video behaviour, unchanged).
+    const wantCount = Math.max(1, Math.min(12, parseInt(m.count, 10) || 1));
     if (!jobId || !prompt) return;
     // v151 — a cancelled job needs up to ~0.5s to wind down.
     if (running && cancelledJob === running) {
@@ -1227,6 +1305,15 @@ window.__aisTouchUI = true;
         if (ups < 2 && img) return 'followup';
         return 'fail';
       };
+      // v169 — dismisses the player/viewer a finished video left
+      // open, so the NEXT video's chip is reachable (batch only).
+      const dismissViewer = () => {
+        try { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true })); } catch (e) {}
+        try { const c = findBtn(['Close']); if (c) c.click(); } catch (e) {}
+      };
+      let delivered = 0;
+      for (;;) {
+      found = null;
       while (Date.now() < hardDeadline && !found) {
         if (cancelledJob === jobId) throw new Error('__cancelled__');
         const v = [...document.querySelectorAll('video')].find((x) => x.src && (x.src.startsWith('http') || x.src.startsWith('blob:')) && !seenSrcs.has(x.src));
@@ -1288,7 +1375,12 @@ window.__aisTouchUI = true;
         }
         await sleep(500);
       }
-      if (!found) throw new Error('Video toiri hoyni — limit sesh hote pare, ba Gemini error diyeche.');
+      if (!found) {
+        // v169 — a batch that already delivered some videos ends
+        // with those (the app marks the missing ones failed).
+        if (delivered > 0) break;
+        throw new Error('Video toiri hoyni — limit sesh hote pare, ba Gemini error diyeche.');
+      }
       let url = found.url;
       let dataUrl = '';
       let durationSec = 0, width = 1620, height = 2880;
@@ -1306,7 +1398,29 @@ window.__aisTouchUI = true;
         });
         url = '';
       }
-      send('video_ready', { jobId, url, dataUrl, durationSec, width, height });
+      send('video_ready', { jobId, url, dataUrl, durationSec, width, height, index: delivered, total: wantCount });
+      delivered++;
+      if (delivered >= wantCount) break;
+      // v169 — batch: get ready for the next video of this turn.
+      seenSrcs.add(found.url);
+      if (openedChip) {
+        try {
+          const nm = mp4Name(openedChip); if (nm) seenChipNames.add(nm);
+          const st = chipStem(openedChip); if (st) seenChipStems.add(st);
+        } catch (e) {}
+      }
+      openedChip = null;
+      followUps = 99; // no keyframe follow-up mid-batch
+      idlePolls = 0;
+      lastPageSig = '';
+      lastBeat = 0;
+      dismissViewer();
+      waitStart = Date.now();
+      deadline = waitStart + videoWaitMs;
+      hardDeadline = waitStart + videoWaitMs + 180000;
+      progress(jobId, 'creating', 'Video ' + delivered + '/' + wantCount + ' pelam — baki gulo banacche…');
+      }
+      if (wantCount > 1) send('video_batch_done', { jobId, count: delivered, total: wantCount });
     } catch (e) {
       const msg = String((e && e.message) || e);
       if (msg === '__cancelled__') { /* the app cancelled this job: no event back */ }
@@ -1319,6 +1433,171 @@ window.__aisTouchUI = true;
     } finally {
       running = null;
       cancelledJob = null;
+    }
+  }
+})();
+
+// v159 — cover-frame capture for a finished animation video.
+// Runs ONLY on a local file:// MP4 page: the hidden cover tab
+// Kotlin opens for one capture (the backend session must stay on
+// the Gemini page, so the cover gets its own tab). The page IS
+// the video — Gecko's built-in viewer already has a <video> — so
+// seek to the requested time, canvas-draw the frame at FULL
+// native size (1620x2880, never downscaled — JPEG 0.85, mirroring
+// the panel's own submitVideo canvas capture) and answer the
+// frame as a JPEG data URL. Never runs on Gemini pages (the
+// driver guard above returns first) or http(s) pages.
+(() => {
+  try {
+    if (window.top !== window.self) return;
+    if (location.protocol !== 'file:') return;
+    if (!/\.mp4($|\?)/i.test(location.pathname)) return;
+    if (window.__ghsCoverInstalled) return;
+    window.__ghsCoverInstalled = true;
+  } catch (e) { return; }
+
+  let port = null;
+  function connect() {
+    try {
+      port = browser.runtime.connect({ name: 'ais-cover' });
+      port.onMessage.addListener((m) => {
+        if (m && m.type === 'coverCapture') onCapture(m);
+      });
+      port.onDisconnect.addListener(() => { port = null; setTimeout(connect, 1000); });
+    } catch (e) { setTimeout(connect, 1000); }
+  }
+  connect();
+
+  function send(id, data, error) {
+    try { port && port.postMessage({ type: 'coverCapture', id: id, data: data || null, error: error || null }); } catch (e) {}
+  }
+  function waitFor(cond, ms) {
+    return new Promise((ok, bad) => {
+      const end = Date.now() + ms;
+      (function tick() {
+        let v = false;
+        try { v = cond(); } catch (e) {}
+        if (v) return ok();
+        if (Date.now() > end) return bad(new Error('metadata timeout'));
+        setTimeout(tick, 100);
+      })();
+    });
+  }
+  function waitEvent(el, name, ms) {
+    return new Promise((ok, bad) => {
+      const to = setTimeout(() => { el.removeEventListener(name, done); bad(new Error(name + ' timeout')); }, ms);
+      function done() { clearTimeout(to); el.removeEventListener(name, done); ok(); }
+      el.addEventListener(name, done);
+    });
+  }
+  function blobToDataUrl(blob) {
+    return new Promise((ok, bad) => {
+      const fr = new FileReader();
+      fr.onload = () => ok(fr.result);
+      fr.onerror = () => bad(fr.error || new Error('read failed'));
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  async function onCapture(m) {
+    const id = m.id;
+    const timeMs = (typeof m.timeMs === 'number' && m.timeMs >= 0) ? m.timeMs : 1000;
+    try {
+      // Gecko's built-in viewer for a video file renders a
+      // <video>; fall back to our own element on the same file.
+      let v = document.querySelector('video');
+      if (!v) {
+        v = document.createElement('video');
+        v.src = location.href;
+        v.muted = true;
+        v.preload = 'auto';
+        v.style.cssText = 'position:fixed;left:0;top:0;width:100%;height:100%;background:#000';
+        document.body.appendChild(v);
+      }
+      v.muted = true;
+      // v166 — prime the software decoder by REALLY playing for
+      // a moment: the old play() -> immediate pause() never
+      // presented a frame in this viewless session, so every
+      // draw was a blank/black canvas (live 2026-11-23: black
+      // panel tiles despite the v162 luminance gate — the gate
+      // can only reject black frames it can measure, and the
+      // brightest blank was still black).
+      try { await v.play(); await new Promise((r) => setTimeout(r, 400)); } catch (e) {}
+      try { v.pause(); } catch (e) {}
+      // Metadata first (native size known) — up to 20s.
+      await waitFor(() => v.readyState >= 1 && v.videoWidth > 0, 20000);
+      const w = v.videoWidth, h = v.videoHeight;
+      if (!w || !h) throw new Error('no video size (videoWidth 0)');
+      // Seek to ~1s (or the requested time) and wait for the
+      // seek to land — up to 20s. Clamp inside the duration so a
+      // short clip still seeks; skip the seek when already there
+      // (no 'seeked' event fires then).
+      let t = timeMs / 1000;
+      if (isFinite(v.duration) && v.duration > 0) t = Math.min(t, Math.max(0, v.duration - 0.05));
+      if (t > 0 && Math.abs(v.currentTime - t) > 0.05) {
+        const seeked = waitEvent(v, 'seeked', 20000);
+        v.currentTime = t;
+        await seeked;
+      }
+      // v167 — wait until the decoder actually has future data
+      // (HAVE_FUTURE_DATA) before asking for a presented frame;
+      // a seek landing on metadata alone still draws blank.
+      try { await waitFor(() => v.readyState >= 3, 3000); } catch (e) {}
+      // v166 — wait for a PRESENTED frame after the seek before
+      // drawing: requestVideoFrameCallback fires only when a
+      // frame is actually presented. When it never fires in this
+      // viewless session, play briefly so the decoder presents
+      // the seek target, then draw — never hang on the wait.
+      let presented = false;
+      await new Promise((res) => {
+        const to = setTimeout(res, 3000);
+        try {
+          if (typeof v.requestVideoFrameCallback === 'function') {
+            v.requestVideoFrameCallback(() => { presented = true; clearTimeout(to); res(); });
+          } else { clearTimeout(to); res(); }
+        } catch (e) { clearTimeout(to); res(); }
+      });
+      if (!presented) {
+        try { await v.play(); await new Promise((r) => setTimeout(r, 300)); } catch (e) {}
+        try { v.pause(); } catch (e) {}
+      }
+      // Full native size — NEVER downscaled (user order:
+      // cover stays 1620x2880).
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('no 2d context');
+      ctx.drawImage(v, 0, 0, w, h);
+      // v167 — never hand back a blank canvas as a frame: sample
+      // the drawn pixels first; a black canvas (no frame was ever
+      // presented in this viewless session) is an error, so the
+      // caller treats it as "no frame" instead of a black thumb.
+      const probe = document.createElement('canvas');
+      probe.width = 32; probe.height = 32;
+      const pctx = probe.getContext('2d');
+      if (pctx) {
+        pctx.drawImage(canvas, 0, 0, 32, 32);
+        let blank = false;
+        try {
+          const d = pctx.getImageData(0, 0, 32, 32).data;
+          let sum = 0; let n = 0;
+          for (let i = 0; i < d.length; i += 4) {
+            sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+            n++;
+          }
+          blank = n > 0 && sum / n < 10;
+        } catch (e) { /* probe failure must not kill a real frame */ }
+        if (blank) throw new Error('blank canvas — kono frame present hoyni');
+      }
+      const blob = await new Promise((ok, bad) => {
+        try { canvas.toBlob((b) => b ? ok(b) : bad(new Error('toBlob null')), 'image/jpeg', 0.85); }
+        catch (e) { bad(e); }
+      });
+      const data = await blobToDataUrl(blob);
+      send(id, data, null);
+    } catch (e) {
+      send(id, null, 'coverCapture: ' + (e && e.message ? e.message : String(e)));
     }
   }
 })();

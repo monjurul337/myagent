@@ -37,6 +37,8 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
+import 'package:flutter/widgets.dart'
+    show AppLifecycleState, WidgetsBinding, WidgetsBindingObserver;
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -49,6 +51,7 @@ import 'gecko_signin.dart';
 import 'session_store.dart';
 import 'models.dart';
 import 'task_backend.dart';
+import 'video_cover.dart';
 
 /// Where the finished videos live on the device, and where the
 /// video list + Task-mode choice are persisted.
@@ -93,7 +96,25 @@ typedef VideoPanelUploader = Future<
       // v158 — the cover URL when a cover was captured + uploaded
       // (null when the video goes without one).
       String? thumbUrl,
+      // v159 — the failed cover step (capture vs R2 upload) when
+      // the video went without a cover, so the failure lands in
+      // the persisted error log instead of being swallowed;
+      // null when a cover was uploaded (or a cached one reused).
+      // v159 SECOND PASS — the hard guarantee: a total cover
+      // failure now THROWS in the uploader before the Firebase
+      // record is pushed, so it never reaches this return; the
+      // field is kept for API compatibility and for the
+      // defensive log branch in AnimationEngine.uploadVideoToPanel.
+      String? coverError,
     })> Function(AnimationVideo video, {String targetAccount});
+
+/// v166 — the manual cover picker: fetches the candidate cover
+/// frames for one video (panel percentage points of its
+/// duration), plus a per-path diagnostic. Injected so the screen
+/// stays testable without a real video file; the app wires the
+/// StudioEngine path.
+typedef CoverCandidatesFetcher = Future<CoverCandidatesResult> Function(
+    AnimationVideo video);
 
 /// v88 — injected by the app: polishes a rough animation idea
 /// into a production-ready video prompt (the StudioEngine's
@@ -116,6 +137,16 @@ typedef TaskBackendRunner = Future<Uint8List> Function(
   required void Function(String phase, String message) onPhase,
   required DateTime deadline,
 });
+
+/// v164 — injected by the app: opens ONE shared backend session
+/// for a whole bulk run (StudioEngine.openTaskVideoSession). The
+/// bulk opens it once and runs every line's Task inside it, so
+/// Gemini sees one continuous bulk job instead of a fresh channel
+/// per line (user order 2026-11-22: "jate o doshta na mone kore").
+/// Null in tests that do not provide it — the bulk then falls back
+/// to the per-line runner, exactly like v163.
+typedef TaskBackendSessionOpener = Future<SharedBackendSession>
+    Function({required DateTime deadline});
 
 /// v145 — injected by the app: the in-page Gemini video driver.
 /// v146 — HEADLESS (user order: browser show na kore, backend-e
@@ -143,6 +174,17 @@ typedef VideoDriverRunner = Future<bool> Function({
 /// page never reported on cannot start later on its own (late-start
 /// = silent quota use + stale events) and the driver's `running`
 /// flag is freed for the next job.
+/// v169 — batch variant of [VideoDriverRunner]: ONE message that asks
+/// Gemini for [count] videos; the driver answers with one
+/// `video_ready` per video (with `index`) and a final
+/// `video_batch_done`. Null = this platform has no batch mode.
+typedef VideoBatchDriverRunner = Future<bool> Function({
+  required String prompt,
+  required String modelId,
+  required String jobId,
+  required int count,
+});
+
 typedef VideoCancelRunner = Future<void> Function(String jobId);
 
 /// v154 — injected by the app: the signed-in session's Cookie header
@@ -155,6 +197,33 @@ typedef VideoCancelRunner = Future<void> Function(String jobId);
 /// A provider failure is swallowed — the download still tries
 /// without cookies rather than failing on a session hiccup.
 typedef VideoCookieHeaderProvider = Future<String> Function();
+
+/// v169 — logs app background/foreground changes while a video job
+/// runs (user report 2026-11-24: generation does not progress with
+/// the screen off). The Error log then shows WHEN the app went to
+/// the background and how long the driver had been quiet when it
+/// came back, so the stall can be pinned on the phone (battery
+/// killer) or on the headless Gemini page (paused in background).
+class _JobLifecycleLogger with WidgetsBindingObserver {
+  _JobLifecycleLogger(this.engine);
+  final AnimationEngine engine;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!engine.busy) return;
+    final last = engine._lastProgressAt;
+    final quiet = last == null
+        ? ''
+        : ' (last progress ${DateTime.now().difference(last).inSeconds}s ago, '
+            'phase ${engine._lastDriverPhase})';
+    final name = state == AppLifecycleState.resumed
+        ? 'foreground-e firlo'
+        : state == AppLifecycleState.paused
+            ? 'background-e gelo (screen off / onno app)'
+            : state.name;
+    unawaited(engine._logError('App $name$quiet'));
+  }
+}
 
 class AnimationEngine {
   AnimationEngine({
@@ -186,8 +255,11 @@ class AnimationEngine {
     VideoMetadataGenerator? metadataGenerator,
     VideoPanelUploader? panelUploader,
     VideoPromptPolisher? promptPolisher,
+    CoverCandidatesFetcher? coverCandidatesFetcher,
     TaskBackendRunner? taskBackendRunner,
+    TaskBackendSessionOpener? taskBackendSessionOpener,
     VideoDriverRunner? videoDriverRunner,
+    VideoBatchDriverRunner? videoBatchDriverRunner,
     VideoCancelRunner? videoCancelRunner,
     VideoCookieHeaderProvider? cookieHeaderProvider,
     // v151 — false = driver FIRST: the Task backend never succeeded
@@ -201,9 +273,12 @@ class AnimationEngine {
         _jobTimeout = jobTimeout,
         _metadataGenerator = metadataGenerator,
         _panelUploader = panelUploader,
+        _coverCandidatesFetcher = coverCandidatesFetcher,
         _promptPolisher = promptPolisher,
         _taskBackendRunner = taskBackendRunner,
+        _taskBackendSessionOpener = taskBackendSessionOpener,
         _videoDriverRunner = videoDriverRunner,
+        _videoBatchDriverRunner = videoBatchDriverRunner,
         _videoCancelRunner = videoCancelRunner,
         _cookieHeaderProvider = cookieHeaderProvider;
 
@@ -239,9 +314,27 @@ class AnimationEngine {
   List<String> errorLog = [];
   final VideoMetadataGenerator? _metadataGenerator;
   final VideoPanelUploader? _panelUploader;
+  // v166 — the manual cover picker's candidate fetcher (the app
+  // wires the StudioEngine path; null = no candidates, e.g.
+  // tests that do not provide it).
+  final CoverCandidatesFetcher? _coverCandidatesFetcher;
   final VideoPromptPolisher? _promptPolisher;
   final TaskBackendRunner? _taskBackendRunner;
+  final TaskBackendSessionOpener? _taskBackendSessionOpener;
+  // v164 — the bulk run's shared backend session (null outside a
+  // bulk run, or when the session could not be opened).
+  SharedBackendSession? _bulkBackendSession;
   final VideoDriverRunner? _videoDriverRunner;
+  final VideoBatchDriverRunner? _videoBatchDriverRunner;
+
+  /// v169 — can this build send ONE message for a whole bulk?
+  bool get supportsBatch => _videoBatchDriverRunner != null;
+
+  // v169 — batch job state (null = a normal single job).
+  List<String>? _batchPrompts;
+  List<BulkAnimationItem>? _batchItems;
+  int _batchSaved = 0;
+  Future<void> _batchChain = Future<void>.value();
   // v145 — driver fallback state, per job: the full Task prompt
   // the driver must send (same text the backend tried), whether
   // the driver already owns this job, and whether it was tried.
@@ -250,6 +343,21 @@ class AnimationEngine {
   String _currentTaskPrompt = '';
   bool _driverTried = false;
   bool _driverActive = false;
+  // v163 — one completer per launched job, completed when the job
+  // TRULY ends (ready incl. the auto-metadata await, or any
+  // error/idle). The bulk runner awaits it so the next line only
+  // starts after the previous video is fully finished — one video
+  // at a time, exactly like tapping Generate by hand.
+  Completer<void>? _jobDoneCompleter;
+
+  // v163 — bulk queue (in-memory; the bulk box text is the source
+  // of truth the user can re-run from, so a restart loses the
+  // queue but never the prompts). Per-line status is shown live
+  // in the bulk card; a failed line never stops the rest.
+  List<BulkAnimationItem> bulkItems = [];
+  bool _bulkRunning = false;
+  bool get bulkRunning => _bulkRunning;
+  bool _bulkCancelled = false;
 
   List<AnimationVideo> videos = [];
   AnimationPhase phase = AnimationPhase.idle;
@@ -269,6 +377,19 @@ class AnimationEngine {
   String selectedModelId = kDefaultAnimationModel;
   bool taskMode = true;
 
+  /// v169 — bulk sends the whole box as ONE Gemini message (persisted;
+  /// default OFF = one message per line, the proven path).
+  bool bulkOneMessage = false;
+
+  Future<void> setBulkOneMessage(bool v) async {
+    bulkOneMessage = v;
+    _emit();
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool('animBulkOneMessage', v);
+    } catch (_) {}
+  }
+
   /// v88 — the style/mood, clip length and seamless-loop choices
   /// (persisted; Cinematic / 10s / loop on by default).
   String selectedStyleId = kDefaultAnimationMoodId;
@@ -286,7 +407,25 @@ class AnimationEngine {
   void _setPhase(AnimationPhase p, [String detail = '']) {
     phase = p;
     status = animationPhaseText(p, detail);
+    // v163 — a job that ends in error/idle is DONE for the bulk
+    // runner (ready is different: _finishBytes completes the job
+    // only AFTER the auto-metadata await, so the next line never
+    // starts while the previous video's metadata is still
+    // fetching — a metadata completion would otherwise clobber
+    // the new job's status line mid-generation).
+    if (p == AnimationPhase.error || p == AnimationPhase.idle) {
+      _markJobDone();
+    }
     _emit();
+  }
+
+  /// v163 — completes the current job's done-signal, once. No-op
+  /// when no job is in flight (guard failures call _setPhase
+  /// before any job starts, and _finishBytes ends with this too).
+  void _markJobDone() {
+    final c = _jobDoneCompleter;
+    _jobDoneCompleter = null;
+    if (c != null && !c.isCompleted) c.complete();
   }
 
   Future<Directory> videosDir() async {
@@ -296,11 +435,20 @@ class AnimationEngine {
     return dir;
   }
 
+  _JobLifecycleLogger? _lifecycleLogger;
+
   Future<void> load() async {
     if (_loaded) return;
     _loaded = true;
+    try {
+      _lifecycleLogger = _JobLifecycleLogger(this);
+      WidgetsBinding.instance.addObserver(_lifecycleLogger!);
+    } catch (_) {
+      // No binding (plain unit tests): lifecycle logging is optional.
+    }
     final prefs = await SharedPreferences.getInstance();
     taskMode = prefs.getBool(kAnimationTaskModeKey) ?? true;
+    bulkOneMessage = prefs.getBool('animBulkOneMessage') ?? false;
     selectedModelId =
         prefs.getString('animModelId') ?? kDefaultAnimationModel;
     if (animationModelById(selectedModelId).locked) {
@@ -343,16 +491,31 @@ class AnimationEngine {
         final f = File(v.localPath);
         if (!await f.exists()) continue;
         final len = await f.length();
-        if (len <= 0 || len > 32 * 1024 * 1024) continue;
-        final info = readMp4Info(await f.readAsBytes());
-        if (info == null) continue;
-        final fps = info.fps > 0 ? info.fps : v.fps;
-        final dur =
-            info.durationSec > 0 ? info.durationSec : v.durationSec;
-        if (fps != v.fps || dur != v.durationSec) {
-          videos[i] = v.copyWith(fps: fps, durationSec: dur);
+        if (len <= 0) continue;
+        var next = v;
+        // v159 second pass — the real file length is the truth
+        // for the card's size too (old records were saved with
+        // sizeBytes 0). The live 36 MB file is above the 32 MB
+        // probe cap below, so the size fix must NOT ride on the
+        // probe — it is fixed from the length alone.
+        if (len != v.sizeBytes) {
+          next = next.copyWith(sizeBytes: len);
           fixed = true;
         }
+        if (len <= 32 * 1024 * 1024) {
+          final info = readMp4Info(await f.readAsBytes());
+          if (info != null) {
+            final fps = info.fps > 0 ? info.fps : next.fps;
+            final dur = info.durationSec > 0
+                ? info.durationSec
+                : next.durationSec;
+            if (fps != next.fps || dur != next.durationSec) {
+              next = next.copyWith(fps: fps, durationSec: dur);
+              fixed = true;
+            }
+          }
+        }
+        videos[i] = next;
       } catch (_) {}
     }
     if (fixed) await _save();
@@ -497,31 +660,37 @@ class AnimationEngine {
     required String modelId,
     required bool signedIn,
     bool fpsRetry = false,
+    List<String>? batchRawPrompts,
   }) async {
+    final batchList = batchRawPrompts ?? const <String>[];
+    final isBatch = batchList.isNotEmpty;
     // v88 — copyright guard FIRST: a prompt naming a brand,
     // character or celebrity can get his Zedge account struck,
     // so it never reaches Gemini.
-    final flags = checkAnimationPromptSafety(rawPrompt);
+    final flags =
+        isBatch ? <String>[] : checkAnimationPromptSafety(rawPrompt);
     if (flags.isNotEmpty) {
       _setPhase(AnimationPhase.error,
           'Copyright risk: "${flags.join(', ')}" — eta brand/character '
           'thakle Zedge account-e strike khete pare. Onno word diye lekho.');
       return false;
     }
-    final prompt = buildAnimationPrompt(
-      rawPrompt,
-      styleId: selectedStyleId,
-      durationSec: selectedDurationSec,
-      seamless: seamlessMode,
-      fpsRetry: fpsRetry,
-    );
+    final prompt = isBatch
+        ? batchList.join(' ')
+        : buildAnimationPrompt(
+            rawPrompt,
+            styleId: selectedStyleId,
+            durationSec: selectedDurationSec,
+            seamless: seamlessMode,
+            fpsRetry: fpsRetry,
+          );
     // v101 — the Task agent must hear "video" FIRST and
     // unambiguously: live 2026-11-20 it answered a video request
     // with a still keyframe image instead ("I can adjust the
     // keyframe's framing…"). The lead sits on the ONE text both the
     // backend and the driver send, so they can never disagree (the
     // driver's own v91 prepend is gone — see content.js).
-    final taskPrompt = taskMode
+    final soloTaskPrompt = taskMode
         ? 'Create a video now — an animation video, an animated MP4 '
             'file, not an image and not a keyframe. Video size '
             '1620x2880, 9:16 vertical, 60 frames per second. '
@@ -535,6 +704,8 @@ class AnimationEngine {
             'video, artwork, character or brand, no copyrighted '
             'element, and avoid common generic scenes. $prompt'
         : prompt;
+    final taskPrompt =
+        isBatch ? _batchTaskPrompt(batchList) : soloTaskPrompt;
     if (prompt.isEmpty) {
       _setPhase(AnimationPhase.error, 'Age ekta prompt likho.');
       return false;
@@ -572,6 +743,10 @@ class AnimationEngine {
           'Backend ready na — browser khulbe na, tai video hobe na.');
       return false;
     }
+    // v163 — the job is really starting now: arm its done-signal
+    // BEFORE any phase change, so a job can never be busy with no
+    // completer for the bulk runner to wait on.
+    _jobDoneCompleter = Completer<void>();
     currentPrompt = rawPrompt.trim();
     currentModelId = model.id;
     currentJobId = DateTime.now().millisecondsSinceEpoch.toString();
@@ -583,6 +758,10 @@ class AnimationEngine {
     _lastProgressAt = null;
     _jobStartedAt = DateTime.now();
     _backendFailure = '';
+    _batchPrompts = isBatch ? List<String>.of(batchList) : null;
+    if (!isBatch) _batchItems = null;
+    _batchSaved = 0;
+    _batchChain = Future<void>.value();
     _setPhase(AnimationPhase.opening);
     _jobTimer?.cancel();
     if (_jobTimeout != null) {
@@ -608,6 +787,11 @@ class AnimationEngine {
       _setPhase(AnimationPhase.error, 'Background service chalu hoyni: $e');
       currentJobId = '';
       return false;
+    }
+    // v169 — batch jobs always go straight to the driver.
+    if (isBatch) {
+      unawaited(_startDriver());
+      return true;
     }
     // v145 — backend FIRST, driver on failure (see _runBackend):
     // the backend never succeeded live, so a backend failure
@@ -676,11 +860,20 @@ class AnimationEngine {
     unawaited(_logError(
         'Driver-e job dilam (job $jobId) — page theke khobor-er opekkha…'));
     try {
-      final posted = await _videoDriverRunner(
-        prompt: _currentTaskPrompt,
-        modelId: currentModelId,
-        jobId: jobId,
-      );
+      final batch = _batchPrompts;
+      final batchRunner = _videoBatchDriverRunner;
+      final posted = (batch != null && batchRunner != null)
+          ? await batchRunner(
+              prompt: _currentTaskPrompt,
+              modelId: currentModelId,
+              jobId: jobId,
+              count: batch.length,
+            )
+          : await _videoDriverRunner(
+              prompt: _currentTaskPrompt,
+              modelId: currentModelId,
+              jobId: jobId,
+            );
       // v150 — Kotlin queued the job instead of posting it: the
       // headless extension port was not connected yet. The handover
       // deadline below fails the job if the port never connects;
@@ -703,6 +896,47 @@ class AnimationEngine {
     }
   }
 
+  /// v164 — one backend call, on the bulk's shared session when one
+  /// is open, else on the per-line runner. A session-dead failure
+  /// re-opens the session ONCE and retries this line on the fresh
+  /// one; any other failure (or a second session death) propagates
+  /// to [_runBackend]'s driver fallback, exactly like before.
+  Future<Uint8List> _callBackend(String prompt,
+      {required DateTime deadline}) async {
+    final session = _bulkBackendSession;
+    if (session == null) {
+      return _taskBackendRunner!(
+        prompt,
+        onPhase: _applyBackendPhase,
+        deadline: deadline,
+      );
+    }
+    try {
+      return await session.runTask(
+        prompt,
+        onPhase: _applyBackendPhase,
+        deadline: deadline,
+      );
+    } on TaskBackendException catch (e) {
+      if (!e.sessionDead) rethrow;
+      unawaited(_logError('Shared backend session more geche '
+          '(${e.step}) — notun session khulchi, line-ta abar try korchi.'));
+      try {
+        await session.close();
+      } catch (_) {}
+      _bulkBackendSession = null;
+      final reopened =
+          await _taskBackendSessionOpener?.call(deadline: deadline);
+      if (reopened == null) rethrow;
+      _bulkBackendSession = reopened;
+      return reopened.runTask(
+        prompt,
+        onPhase: _applyBackendPhase,
+        deadline: deadline,
+      );
+    }
+  }
+
   /// v92 — runs the Task backend and finishes with its MP4 bytes.
   /// v145 — a backend failure NO LONGER ends the job when the
   /// driver exists: it hands the same prompt to the headless
@@ -713,11 +947,7 @@ class AnimationEngine {
     final jobId = currentJobId;
     final deadline = DateTime.now().add(_jobTimeout ?? const Duration(days: 365));
     try {
-      final bytes = await _taskBackendRunner!(
-        prompt,
-        onPhase: _applyBackendPhase,
-        deadline: deadline,
-      );
+      final bytes = await _callBackend(prompt, deadline: deadline);
       if (currentJobId != jobId || jobId.isEmpty) return;
       // The watchdog already handed this job to the driver while
       // the backend was quiet — the driver owns it now.
@@ -877,6 +1107,10 @@ class AnimationEngine {
   Future<void> cancelJob() async {
     final jobId = currentJobId;
     if (jobId.isEmpty || !busy) return;
+    // v163 — a Cancel mid-bulk stops the whole queue, not just
+    // this line: the runner would otherwise start the next line
+    // at once and the tap would look like it did nothing.
+    _bulkCancelled = true;
     _cancelledJobIds.add(jobId);
     _jobTimer?.cancel();
     _watchdogTimer?.cancel();
@@ -888,6 +1122,223 @@ class AnimationEngine {
     _driverActive = false;
     _setPhase(AnimationPhase.idle);
     status = 'Cancel kora hoyeche.';
+    _emit();
+  }
+
+  /// v163 — bulk animation (user order 2026-11-22: "line by line
+  /// prompt dilam"): [prompts] is the parsed bulk box (one prompt
+  /// per line, already trimmed + deduped by
+  /// [parseBulkAnimationPrompts]). Every line runs through the
+  /// SAME [start] as a hand-tapped Generate — same master prompt,
+  /// same backend-then-driver route, same Task mode, same Neon
+  /// default, same per-video card + auto-metadata + cover — one
+  /// line at a time, in order. Each line is its OWN separate
+  /// request to Gemini (its own Task prompt / generation job) —
+  /// the lines are NEVER combined into one prompt or one request
+  /// (user clarification 2026-11-22: "Gemini-teo jeno oivabe
+  /// requests jay"). A failed line is logged (v140 log)
+  /// and the queue CONTINUES with the next line; a copyright-risk
+  /// line is skipped up front with its reason and never reaches
+  /// Gemini. Returns when the whole queue is done (or stopped);
+  /// the caller does not await it. The bulk box text is NOT
+  /// cleared here — the screen keeps it until the user taps Clear,
+  /// so a failed line can be re-run by generating again.
+  Future<void> startBulk({
+    required List<String> prompts,
+    required String modelId,
+    required bool signedIn,
+  }) async {
+    if (_bulkRunning) {
+      status = 'Bulk cholche — sesh hok, tarpor abar dao.';
+      _emit();
+      return;
+    }
+    if (busy) {
+      status = 'Ekta animation cholche — sesh hok, tarpor bulk dao.';
+      _emit();
+      return;
+    }
+    if (!signedIn) {
+      _setPhase(AnimationPhase.error,
+          'Age Gemini-te sign in koro (Login tab).');
+      return;
+    }
+    final model = animationModelById(modelId);
+    if (model.locked) {
+      _setPhase(AnimationPhase.error,
+          '${model.label} ekhono lock kora — Neon diye banaw.');
+      return;
+    }
+    bulkItems = [
+      for (var i = 0; i < prompts.length; i++)
+        BulkAnimationItem(id: 'bulk_$i', prompt: prompts[i]),
+    ];
+    // Guard pre-check per line: a risky line is skipped here with
+    // its reason — it never reaches Gemini, and the rest still run.
+    for (final item in bulkItems) {
+      final flags = checkAnimationPromptSafety(item.prompt);
+      if (flags.isNotEmpty) {
+        item.status = BulkAnimationStatus.skipped;
+        item.note = 'Copyright risk: "${flags.join(', ')}" — eta '
+            'brand/character thakle Zedge account-e strike khete pare. '
+            'Onno word diye lekho.';
+      }
+    }
+    final runnable = bulkItems
+        .where((i) => i.status == BulkAnimationStatus.queued)
+        .length;
+    if (runnable == 0) {
+      status = 'Bulk-e kono chalano-joggo line nai — shob skip hoyeche.';
+      _emit();
+      return;
+    }
+    _bulkRunning = true;
+    _bulkCancelled = false;
+    _emit();
+    try {
+      // v164 — one shared backend session for the whole bulk: the
+      // channel opens ONCE here and every line runs its Task
+      // inside it, instead of a fresh channel per line. Only when
+      // the backend is the path in use (backendFirst): with the
+      // driver first the backend is never called, so an opened
+      // session would only idle-poll the stream on his slow
+      // network. An open failure is NOT fatal — the lines fall
+      // back to the per-line runner (v163 behaviour) and the run
+      // continues.
+      final bulkDeadline =
+          DateTime.now().add(_jobTimeout ?? const Duration(days: 365));
+      if (backendFirst && _taskBackendSessionOpener != null) {
+        status = 'Bulk session khulche — ek session-e sob line cholbe…';
+        _emit();
+        try {
+          _bulkBackendSession =
+              await _taskBackendSessionOpener(deadline: bulkDeadline);
+        } catch (e) {
+          _bulkBackendSession = null;
+          unawaited(_logError('Bulk backend session kholeni ($e) — '
+              'prottek line alada session-e cholbe.'));
+        }
+      }
+      var done = 0;
+      var failed = 0;
+      final skipped = bulkItems
+          .where((i) => i.status == BulkAnimationStatus.skipped)
+          .length;
+      for (final item in bulkItems) {
+        if (_bulkCancelled) break;
+        if (item.status != BulkAnimationStatus.queued) continue;
+        // A single job the user started by hand mid-bulk (the
+        // Generate button is live between lines): wait for it to
+        // finish instead of failing this line on the busy guard.
+        while (busy) {
+          final doneFuture = _jobDoneCompleter?.future;
+          if (doneFuture == null) break;
+          await doneFuture;
+          if (_bulkCancelled) break;
+        }
+        if (_bulkCancelled) break;
+        item.status = BulkAnimationStatus.running;
+        _emit();
+        final ok = await start(
+            rawPrompt: item.prompt, modelId: modelId, signedIn: signedIn);
+        if (!ok) {
+          // A global blocker (signed out / Task mode off / locked
+          // model / no backend) would fail EVERY remaining line
+          // the same way — stop the run and say why instead of
+          // failing the whole queue one line at a time. A real
+          // per-line failure (backend/driver error) never stops
+          // the rest — it is marked failed below, after the wait.
+          if (_isBulkStoppingReason(status)) {
+            item.status = BulkAnimationStatus.failed;
+            item.note = status;
+            failed++;
+            unawaited(_logError('Bulk "${item.prompt}" — $status'));
+            status = 'Bulk thamlo: $status';
+            _emit();
+            break;
+          }
+          item.status = BulkAnimationStatus.failed;
+          item.note = status;
+          failed++;
+          unawaited(_logError('Bulk "${item.prompt}" — $status'));
+          _emit();
+          continue;
+        }
+        // The job runs in the background (backend → driver): wait
+        // for its true end (ready incl. auto-metadata, or any
+        // error/idle) before the next line.
+        await _jobDoneCompleter?.future;
+        if (_bulkCancelled) {
+          // Stopped mid-line: the video either landed just before
+          // the cancel (done) or never did (failed, with the
+          // cancel note) — never leave the line stuck on running.
+          if (phase == AnimationPhase.ready) {
+            item.status = BulkAnimationStatus.done;
+            done++;
+          } else {
+            item.status = BulkAnimationStatus.failed;
+            item.note = status;
+            failed++;
+          }
+          _emit();
+          break;
+        }
+        if (phase == AnimationPhase.ready) {
+          item.status = BulkAnimationStatus.done;
+          done++;
+        } else {
+          item.status = BulkAnimationStatus.failed;
+          item.note = status;
+          failed++;
+          unawaited(_logError('Bulk "${item.prompt}" — $status'));
+        }
+        _emit();
+      }
+      final total = bulkItems.length;
+      status = _bulkCancelled
+          ? 'Bulk thamano hoyeche — $done/$total hoyeche.'
+          : 'Bulk sesh ✓ — $done done, $failed failed, $skipped '
+              'skipped (mot $total).';
+      _emit();
+    } finally {
+      final bulkSession = _bulkBackendSession;
+      _bulkBackendSession = null;
+      if (bulkSession != null) {
+        try {
+          await bulkSession.close();
+        } catch (_) {}
+      }
+      _bulkRunning = false;
+      _emit();
+    }
+  }
+
+  /// v163 — the [start] guard messages that mean the WHOLE bulk
+  /// run cannot proceed (not a per-line failure): signed out,
+  /// Task mode off, locked model, or no backend/driver at all.
+  /// Matched on the guard's own status text, in one place.
+  bool _isBulkStoppingReason(String s) =>
+      s.contains('sign in') ||
+      s.contains('Task mode ON koro') ||
+      s.contains('lock kora') ||
+      s.contains('Backend ready na');
+
+  /// v163 — stops a running bulk queue: the current job is
+  /// cancelled (same as the Cancel button) and the remaining
+  /// lines never start. Lines still queued stay queued, so the
+  /// user can see what never ran.
+  Future<void> cancelBulk() async {
+    _bulkCancelled = true;
+    if (busy) await cancelJob();
+    _emit();
+  }
+
+  /// v163 — clears the bulk run's per-line list (the Clear button
+  /// in the bulk card). Only when no bulk run is active — clearing
+  /// mid-run would hide the running line's status.
+  void clearBulkItems() {
+    if (_bulkRunning) return;
+    bulkItems = [];
     _emit();
   }
 
@@ -918,7 +1369,20 @@ class AnimationEngine {
         _applyDriverPhase(ev.phase, ev.message);
         return true;
       case 'video_ready':
+        if (_batchPrompts != null) {
+          // v169 — batch: videos are saved one after another, never
+          // two at once.
+          _lastProgressAt = DateTime.now();
+          _batchChain = _batchChain.then((_) => _finishReady(ev));
+          await _batchChain;
+          return true;
+        }
         await _finishReady(ev);
+        return true;
+      case 'video_batch_done':
+        if (_batchPrompts == null) return false;
+        _batchChain = _batchChain.then((_) => _finishBatch());
+        await _batchChain;
         return true;
       case 'video_error':
         _jobTimer?.cancel();
@@ -998,6 +1462,14 @@ class AnimationEngine {
   }
 
   Future<void> _finishReady(AnimationVideoEvent ev) async {
+    // v169 — batch: which prompt this video belongs to.
+    final batch = _batchPrompts;
+    int? batchIdx;
+    if (batch != null) {
+      batchIdx = ev.index >= 0 ? ev.index : _batchSaved;
+      if (batchIdx >= batch.length) batchIdx = batch.length - 1;
+      currentPrompt = batch[batchIdx].trim();
+    }
     _setPhase(AnimationPhase.downloading);
     try {
       final Uint8List bytes;
@@ -1033,8 +1505,22 @@ class AnimationEngine {
         throw 'Gemini video-r URL deyni.';
       }
       await _finishBytes(bytes,
-          width: ev.width, height: ev.height, durationSec: ev.durationSec);
+          width: ev.width,
+          height: ev.height,
+          durationSec: ev.durationSec,
+          batchIndex: batchIdx);
     } catch (e) {
+      if (batchIdx != null) {
+        // v169 — one bad download never ends the batch.
+        unawaited(_logError('Batch video ${batchIdx + 1}: $e'));
+        final items = _batchItems;
+        if (items != null && batchIdx < items.length) {
+          items[batchIdx].status = BulkAnimationStatus.failed;
+          items[batchIdx].note = e.toString();
+        }
+        _setPhase(AnimationPhase.creating);
+        return;
+      }
       _jobTimer?.cancel();
       if (taskMode) ForegroundKeepAlive.release();
       currentJobId = '';
@@ -1050,7 +1536,8 @@ class AnimationEngine {
   Future<void> _finishBytes(Uint8List bytes,
       {int width = 1620,
       int height = 2880,
-      double durationSec = 0}) async {
+      double durationSec = 0,
+      int? batchIndex}) async {
     // v154 — the choke point: the bytes MUST be an MP4 before
     // anything is saved. Live 2026-11-22 an auth-gated download
     // answered HTTP 200 with an HTML sign-in page, which was saved
@@ -1097,20 +1584,224 @@ class AnimationEngine {
     );
     videos = [video, ...videos];
     await _save();
-    _jobTimer?.cancel();
-    if (taskMode) {
-      ForegroundKeepAlive.release();
-      await ForegroundKeepAlive.notifyDone(
-          'Animation ready', '"$title" download hoye geche.');
+    if (batchIndex == null) {
+      _jobTimer?.cancel();
+      if (taskMode) {
+        ForegroundKeepAlive.release();
+        await ForegroundKeepAlive.notifyDone(
+            'Animation ready', '"$title" download hoye geche.');
+      }
+      currentJobId = '';
+      _setPhase(AnimationPhase.ready);
+    } else {
+      // v169 — batch: this video is saved, the job continues until
+      // the driver reports the whole message done.
+      _batchSaved++;
+      final items = _batchItems;
+      if (items != null && batchIndex < items.length) {
+        items[batchIndex].status = BulkAnimationStatus.done;
+      }
+      _setPhase(AnimationPhase.creating);
+      status = 'Video $_batchSaved/${_batchPrompts?.length ?? 0} ready ✓ — '
+          'baki gulo banacche…';
+      _emit();
     }
-    currentJobId = '';
-    _setPhase(AnimationPhase.ready);
     // v154 — say so on the status line when Gemini rendered slower
     // than the 60fps that was asked for, so the next report names
     // it instead of the card silently claiming 60fps.
+    // v159 second pass — same for an over-target file: the clip
+    // was asked for under 10 MB, so when Gemini gives a bigger
+    // file the status names it (the card's sizeNote shows it too).
+    // The video itself stays usable — size never blocks anything.
+    final sizeNotes = <String>[];
     if (fps > 0 && fps != 60) {
-      status =
-          'Animation ready ✓ — video ${fps}fps-e esheche (60fps chawa hoyechilo).';
+      sizeNotes.add('video ${fps}fps-e esheche (60fps chawa hoyechilo)');
+    }
+    if (size > kVideoTargetMaxSizeBytes) {
+      sizeNotes.add(
+          'file ${(size / 1000000).toStringAsFixed(1)} MB — 10 MB chawa hoyechilo');
+    }
+    if (sizeNotes.isNotEmpty) {
+      status = 'Animation ready ✓ — ${sizeNotes.join('; ')}.';
+      _emit();
+    }
+    // v161 — AUTO AI metadata on video-ready (user order
+    // 2026-11-22: "ভিডিও জেনারেশন শেষ হলে অটো মেটা ডেটা নেবে"):
+    // a finished video fetches its own metadata — no sparkle
+    // tap needed. Only when a generator exists (tests / builds
+    // without one keep the old behaviour exactly — the null
+    // early-return in generateMetadataForVideo would otherwise
+    // clobber the ready status). A failure never blocks the
+    // video: generateMetadataForVideo records metadataFailed on
+    // it, and the ready status (with the fps/size notes) is
+    // restored instead of being overwritten by the error.
+    if (_metadataGenerator != null) {
+      final readyStatus = status;
+      final ok = await generateMetadataForVideo(video);
+      if (!ok) {
+        status = readyStatus;
+        _emit();
+      }
+    }
+    // v163 — the video is FULLY finished now (metadata included):
+    // the bulk runner may start the next line.
+    if (batchIndex == null) _markJobDone();
+  }
+
+  /// v169 — the ONE message of a batch: the same "video first" lead as
+  /// a single job, then every prompt (with its own spec suffix) as a
+  /// numbered video, in order.
+  String _batchTaskPrompt(List<String> rawPrompts) {
+    final n = rawPrompts.length;
+    final b = StringBuffer()
+      ..write('Create $n separate animation videos now — one animated MP4 '
+          'file for EACH of the $n prompts below ($n videos in total), '
+          'not images and not keyframes. Every video: size 1620x2880, '
+          '9:16 vertical, 60 frames per second. Make each one original '
+          'and unique — not a copy of any existing video, artwork, '
+          'character or brand, no copyrighted element. Make all $n '
+          'videos in this one task, in order, and keep the prompts '
+          'separate.\n\n');
+    for (var i = 0; i < n; i++) {
+      final built = buildAnimationPrompt(
+        rawPrompts[i],
+        styleId: selectedStyleId,
+        durationSec: selectedDurationSec,
+        seamless: seamlessMode,
+        fpsRetry: false,
+      );
+      b.write('Video ${i + 1}: $built\n\n');
+    }
+    return b.toString().trim();
+  }
+
+  /// v169 — the driver says the batch message is over (all videos
+  /// delivered, or Gemini stopped early): lines that never got a
+  /// video are failed, the job ends.
+  Future<void> _finishBatch() async {
+    final prompts = _batchPrompts;
+    if (prompts == null) return;
+    _jobTimer?.cancel();
+    if (taskMode) {
+      ForegroundKeepAlive.release();
+      await ForegroundKeepAlive.notifyDone('Animations ready',
+          '$_batchSaved/${prompts.length} video download hoye geche.');
+    }
+    final items = _batchItems;
+    if (items != null) {
+      for (final it in items) {
+        if (it.status == BulkAnimationStatus.running) {
+          it.status = BulkAnimationStatus.failed;
+          it.note = 'Gemini ei video-ta dey-ni.';
+        }
+      }
+    }
+    currentJobId = '';
+    if (_batchSaved > 0) {
+      _setPhase(AnimationPhase.ready);
+      status = 'Batch sesh ✓ — $_batchSaved/${prompts.length} video.';
+      _emit();
+      _markJobDone();
+    } else {
+      _setPhase(AnimationPhase.error, 'Gemini kono video dey-ni.');
+    }
+  }
+
+  /// v169 — ONE-MESSAGE bulk (user order 2026-11-24): every line is
+  /// sent to Gemini in a single Task message that asks for one video
+  /// per prompt; the videos come back one by one and each is saved as
+  /// its own card. Lines the guard rejects are skipped up front.
+  Future<void> startBulkBatch({
+    required List<String> prompts,
+    required String modelId,
+    required bool signedIn,
+  }) async {
+    if (_videoBatchDriverRunner == null) {
+      status = 'Ek message mode ei device-e nai — Line by line use koro.';
+      _emit();
+      return;
+    }
+    if (_bulkRunning) {
+      status = 'Bulk cholche — sesh hok, tarpor abar dao.';
+      _emit();
+      return;
+    }
+    if (busy) {
+      status = 'Ekta animation cholche — sesh hok, tarpor bulk dao.';
+      _emit();
+      return;
+    }
+    if (!signedIn) {
+      _setPhase(AnimationPhase.error,
+          'Age Gemini-te sign in koro (Login tab).');
+      return;
+    }
+    final model = animationModelById(modelId);
+    if (model.locked) {
+      _setPhase(AnimationPhase.error,
+          '${model.label} ekhono lock kora — Neon diye banaw.');
+      return;
+    }
+    bulkItems = [
+      for (var i = 0; i < prompts.length; i++)
+        BulkAnimationItem(id: 'bulk_$i', prompt: prompts[i]),
+    ];
+    for (final item in bulkItems) {
+      final flags = checkAnimationPromptSafety(item.prompt);
+      if (flags.isNotEmpty) {
+        item.status = BulkAnimationStatus.skipped;
+        item.note = 'Copyright risk: "${flags.join(', ')}" — eta '
+            'brand/character thakle Zedge account-e strike khete pare. '
+            'Onno word diye lekho.';
+      }
+    }
+    final items = bulkItems
+        .where((i) => i.status == BulkAnimationStatus.queued)
+        .toList();
+    if (items.isEmpty) {
+      status = 'Bulk-e kono chalano-joggo line nai — shob skip hoyeche.';
+      _emit();
+      return;
+    }
+    _bulkRunning = true;
+    _bulkCancelled = false;
+    for (final it in items) {
+      it.status = BulkAnimationStatus.running;
+    }
+    _batchItems = items;
+    _emit();
+    try {
+      final ok = await start(
+        rawPrompt: items.first.prompt,
+        modelId: modelId,
+        signedIn: signedIn,
+        batchRawPrompts: [for (final it in items) it.prompt],
+      );
+      if (!ok) {
+        for (final it in items) {
+          it.status = BulkAnimationStatus.failed;
+          it.note = status;
+        }
+        _emit();
+        return;
+      }
+      await _jobDoneCompleter?.future;
+      var done = 0;
+      for (final it in items) {
+        if (it.status == BulkAnimationStatus.running) {
+          it.status = BulkAnimationStatus.failed;
+          it.note = phase == AnimationPhase.error ? status : 'Video ashe-ni.';
+        }
+        if (it.status == BulkAnimationStatus.done) done++;
+      }
+      if (done == 0 && items.isNotEmpty) {
+        unawaited(_logError('Batch: kono video ashe-ni — $status'));
+      }
+      _batchPrompts = null;
+      _emit();
+    } finally {
+      _batchPrompts = null;
+      _bulkRunning = false;
       _emit();
     }
   }
@@ -1161,18 +1852,63 @@ class AnimationEngine {
     _emit();
     try {
       final meta = await _metadataGenerator(video);
-      _replaceVideo(video.copyWith(metadata: meta));
+      _replaceVideo(
+          video.copyWith(metadata: meta, metadataFailed: false));
       await _save();
       status = 'AI Metadata ready: "${meta.title}"';
       return true;
     } catch (e) {
       status = 'Metadata hoyni: $e';
+      // v161 — the failure is recorded ON the video, so the card
+      // can show the Banglish note + manual retry (the video
+      // itself stays usable; a failed fetch never blocks it).
+      // A later success clears the flag (see above).
+      _replaceVideo(video.copyWith(metadataFailed: true));
+      await _save();
       return false;
     } finally {
       busyVideoId = null;
       busyAction = '';
       _emit();
     }
+  }
+
+  /// v166 — candidate cover frames for the manual picker on the
+  /// video card (an empty result when the fetcher is not wired,
+  /// e.g. tests, or when nothing could be captured). v167: an
+  /// empty or all-dark result is written to the Error log with
+  /// the per-path diagnostic, so the next black-thumb failure
+  /// names the path instead of failing silently. A fetch failure
+  /// is swallowed the same way — the card shows its own note.
+  Future<CoverCandidatesResult> coverCandidates(AnimationVideo video) async {
+    final fetcher = _coverCandidatesFetcher;
+    if (fetcher == null) {
+      return const CoverCandidatesResult(frames: []);
+    }
+    try {
+      final result = await fetcher(video);
+      if (result.frames.isEmpty || result.allDark) {
+        unawaited(_logError('Cover frame: '
+            '${result.diagnostic.isEmpty ? 'kono frame pelam na' : result.diagnostic}'));
+      }
+      return result;
+    } catch (e) {
+      return CoverCandidatesResult(
+          frames: [], diagnostic: 'fetch korte giye vul: $e');
+    }
+  }
+
+  /// v166 — the user picked a cover frame on the card ([timeMs]
+  /// into the video; -1 = back to Auto). Persisted on the video
+  /// so the pick survives a restart and the next panel upload
+  /// captures exactly this timestamp.
+  Future<void> pickCoverFrame(AnimationVideo video, int timeMs) async {
+    _replaceVideo(video.copyWith(pickedCoverTimeMs: timeMs));
+    await _save();
+    status = timeMs >= 0
+        ? 'Cover frame beche neoa holo (${(timeMs / 1000).toStringAsFixed(1)}s) — porer upload-e eitai jabe.'
+        : 'Cover frame Auto-te firlo — upload-e gate-passing frame use hobe.';
+    _emit();
   }
 
   /// v87 — uploads one video to the panel (R2 file + Firebase
@@ -1206,9 +1942,28 @@ class AnimationEngine {
         },
       ));
       await _save();
+      // v159 — the video uploaded fine, but a cover failure must
+      // not vanish: write the actual step + reason into the
+      // persisted error log so the Animation screen shows WHY the
+      // panel card has no cover (live 2026-11-22: v158 swallowed
+      // it with a brief status note and the record went without
+      // thumbUrl, with nothing to diagnose from).
+      if (result.coverError != null && result.coverError!.isNotEmpty) {
+        await _logError('Cover (${video.fileName}): ${result.coverError}');
+      }
       status = 'Panel-e upload hoye geche (${result.accountName}) ✓';
       return true;
     } catch (e) {
+      // v159 second pass — the thumbnail block must land in the
+      // persisted error log (step + exception), not just the
+      // status line: the StudioEngine throws 'Thumbnail banano
+      // jayni…' before the Firebase push, and the video stays on
+      // the device — the log is how the Animation screen shows
+      // WHY it is still there. Other upload failures keep the
+      // old behaviour (status only).
+      if ('$e'.contains('Thumbnail banano jayni')) {
+        await _logError('Cover (${video.fileName}): $e');
+      }
       status = 'Panel upload hoyni: $e';
       return false;
     } finally {
@@ -1291,7 +2046,19 @@ class AnimationEngine {
   }
 
   void dispose() {
+    final lg = _lifecycleLogger;
+    if (lg != null) {
+      try {
+        WidgetsBinding.instance.removeObserver(lg);
+      } catch (_) {}
+      _lifecycleLogger = null;
+    }
     _jobTimer?.cancel();
     _watchdogTimer?.cancel();
+    // v163 — a bulk run in flight must not dangle on a completer
+    // that will never complete: stop it and release the waiter.
+    _bulkCancelled = true;
+    _bulkRunning = false;
+    _markJobDone();
   }
 }

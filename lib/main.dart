@@ -20,6 +20,7 @@ import 'app_theme.dart';
 import 'foreground_keep_alive.dart';
 import 'gecko_browser.dart';
 import 'gecko_signin.dart';
+import 'meta_card_style.dart';
 import 'video_playback.dart';
 import 'voice_prompt.dart';
 import 'windows_session_renewal.dart';
@@ -395,6 +396,11 @@ class _HomeScreenState extends State<HomeScreen> {
       metadataGenerator: (video) => _engine.generateVideoMetadata(video),
       panelUploader: (video, {targetAccount = 'spread'}) =>
           _engine.uploadVideoToPanel(video, targetAccount: targetAccount),
+      // v166 — the manual cover picker: candidate frames come
+      // from the StudioEngine's capture paths (native retriever
+      // first, then plugin / browser / Chrome).
+      coverCandidatesFetcher: (video) =>
+          _engine.captureCoverCandidatesFor(video),
       // v88: the video Prompt Polish runs on the same StudioEngine
       // Gemini session as the image Prompt Polish.
       promptPolisher: (prompt) => _engine.polishVideoPrompt(prompt),
@@ -406,6 +412,13 @@ class _HomeScreenState extends State<HomeScreen> {
               {required onPhase, required deadline}) =>
           _engine.runTaskVideoBackend(taskText,
               onPhase: onPhase, deadline: deadline),
+      // v164 — one shared backend session for a whole bulk run:
+      // the bulk opens ONE processSession channel and every line
+      // runs its Task inside it, instead of a fresh channel per
+      // line (user order 2026-11-22: "jate o doshta na mone kore").
+      // Single jobs never touch it — they keep the per-line runner.
+      taskBackendSessionOpener: ({required DateTime deadline}) =>
+          _engine.openTaskVideoSession(deadline: deadline),
       // v146 — browser driver fallback, HEADLESS (user order:
       // browser show na kore, backend-e chole): NO browser window
       // ever opens — the job runs inside the invisible headless
@@ -428,6 +441,17 @@ class _HomeScreenState extends State<HomeScreen> {
         }
         return GeckoBrowser.instance.startVideoHeadless(prompt, modelId, jobId);
       },
+      // v169 — ONE-message bulk: Android only (the Windows driver
+      // script has no batch support).
+      videoBatchDriverRunner: defaultTargetPlatform == TargetPlatform.windows
+          ? null
+          : ({required prompt,
+              required modelId,
+              required jobId,
+              required count}) async {
+              return GeckoBrowser.instance
+                  .startVideoHeadless(prompt, modelId, jobId, count: count);
+            },
       // v151 — Dart giving up (or the user cancelling) also drops the
       // job on the native side, so it cannot start hours later.
       videoCancelRunner: (jobId) {
@@ -1564,6 +1588,34 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  // v163 — bulk animation from the SAME prompt box: several lines,
+  // one animation per line, run one by one through the same engine
+  // (see AnimationEngine.startBulk). Same platform guard as the
+  // single Generate — Android / Windows only.
+  Future<void> _generateBulkAnimation(
+      List<String> prompts, String modelId) async {
+    if (defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.windows) {
+      _snack('Video generation ekhon Android / Windows app-e.');
+      return;
+    }
+    // v169 — "Ek message-e shob" sends the whole box as ONE Gemini
+    // message; the default stays one message per line.
+    if (_animEngine.bulkOneMessage && _animEngine.supportsBatch) {
+      await _animEngine.startBulkBatch(
+        prompts: prompts,
+        modelId: modelId,
+        signedIn: _isSignedIn,
+      );
+      return;
+    }
+    await _animEngine.startBulk(
+      prompts: prompts,
+      modelId: modelId,
+      signedIn: _isSignedIn,
+    );
+  }
+
   // v154 — manual "60fps-e abar banaw" retry from the video card:
   // same prompt + model, stronger 60fps wording (see
   // buildAnimationPrompt fpsRetry). The card asks first — a
@@ -1935,6 +1987,7 @@ class _HomeScreenState extends State<HomeScreen> {
         signedIn: _isSignedIn,
         wide: wide,
         onGenerate: _generateAnimation,
+        onBulkGenerate: _generateBulkAnimation,
         onPlay: _previewAnimationVideo,
         onDelete: _deleteAnimation,
         onExportZip: _exportAnimationsZip,
@@ -2132,7 +2185,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
               PopupMenuItem(
                 enabled: false,
-                child: Text('Version 2.5.93',
+                child: Text('Version 2.5.102',
                     style: TextStyle(
                         fontSize: 12, color: cs.onSurfaceVariant)),
               ),
@@ -3763,19 +3816,7 @@ class _SetCardState extends State<SetCard> {
 
   /// One hashtag chip, shared by the collapsed (one scrollable
   /// row) and expanded (wrapped) tag layouts.
-  Widget _tagChip(String tag) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: const Color(0xFF12121B),
-        border: Border.all(color: Colors.white12),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text('#$tag',
-          style:
-              const TextStyle(fontSize: 13, color: Color(0xFFC9C9D2))),
-    );
-  }
+  Widget _tagChip(String tag) => metaTagChip(tag);
 
   /// Inner metadata card in the reference showcase design: title +
   /// category pill + AI sparkle, the model line, the description and
@@ -3823,9 +3864,9 @@ class _SetCardState extends State<SetCard> {
       width: double.infinity,
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surfaceContainer,
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(kMetaCardRadius),
       ),
-      padding: const EdgeInsets.all(12),
+      padding: kMetaCardPadding,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -3843,7 +3884,7 @@ class _SetCardState extends State<SetCard> {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF7A68E0),
+                    color: kMetaCategoryPillColor,
                     borderRadius: BorderRadius.circular(999),
                   ),
                   child: Text(meta.category.toUpperCase(),

@@ -10,6 +10,7 @@ import 'package:video_player/video_player.dart';
 import '../mp4_info.dart';
 import '../video_playback.dart';
 import 'gecko_video_view.dart';
+import 'video_preview_wrapper.dart';
 
 /// Realistic phone mockup preview: shows a generated wallpaper as it
 /// would look on a device — plain wallpaper, lock screen, home screen,
@@ -265,8 +266,16 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
   /// codec line shown with it. [_fallbackDone] guards the
   /// switch so it fires exactly once (init error + runtime
   /// error can both arrive for the same failure).
+  /// v159 second pass — [_browserFallbackUrl] is the wrapper page
+  /// URL the browser view loads (see video_preview_wrapper.dart),
+  /// and [_browserFallbackWrapperPath] is the sidecar file behind
+  /// it, deleted when the dialog closes. The note itself is NEVER
+  /// drawn over the video anymore — it lives under the mockup
+  /// (the hint line) instead.
   bool _browserFallback = false;
   String? _decoderNote;
+  String? _browserFallbackUrl;
+  String? _browserFallbackWrapperPath;
   bool _fallbackDone = false;
 
   String get _currentImageUrl {
@@ -300,6 +309,15 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
   void dispose() {
     _videoCtl?.removeListener(_onVideoValue);
     _videoCtl?.dispose();
+    // v159 second pass — the preview wrapper is a sidecar of this
+    // dialog; remove it when the dialog closes (best effort — the
+    // video file itself is never touched).
+    final wrapperPath = _browserFallbackWrapperPath;
+    if (wrapperPath != null) {
+      try {
+        File(wrapperPath).deleteSync();
+      } catch (_) {}
+    }
     _foldCtl.dispose();
     super.dispose();
   }
@@ -378,6 +396,12 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
   /// view plays the same local file. Never throws. Synchronous
   /// (see readMp4MoovBytes): the probe must complete in the
   /// dialog's fake-async test zone as well as on the device.
+  /// v159 second pass — the browser view loads the WRAPPER page
+  /// (see video_preview_wrapper.dart), not the raw MP4 URL: the
+  /// wrapper's cover-fit <video> fills the screen with no browser
+  /// chrome and no black bars. The decoder note is kept for the
+  /// hint line UNDER the mockup — it is never drawn over the
+  /// video anymore.
   void _enterBrowserFallback(String rawError) {
     if (_fallbackDone) return;
     _fallbackDone = true;
@@ -395,12 +419,20 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
         }
       }
     }
+    // v159 second pass — wrapper page beside the MP4 (best
+    // effort: null falls back to the raw MP4 URL, old behaviour).
+    final wrapperUrl = path == null ? null : writeVideoPreviewWrapper(path);
+    final wrapperPath = wrapperUrl == null
+        ? null
+        : Uri.tryParse(wrapperUrl)?.toFilePath();
     if (!mounted) return;
     _videoCtl?.dispose();
     _videoCtl = null;
     if (!mounted) return;
     setState(() {
       _browserFallback = true;
+      _browserFallbackUrl = wrapperUrl;
+      _browserFallbackWrapperPath = wrapperPath;
       _videoError = null;
       _videoReady = false;
       _videoPlaying = false;
@@ -435,43 +467,26 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
     // v156 — decoder fallback: the phone's hardware decoder
     // rejected the file, so the mockup plays it in the embedded
     // browser engine (GeckoView) — still ON THE DEVICE, inside
-    // the phone frame, with the Banglish note + measured codec
-    // line at the bottom. The browser view has its own tap
-    // controls; the dialog's play/pause button stays disabled
-    // (it drives video_player, not the browser view).
+    // the phone frame. The browser view has its own tap controls;
+    // the dialog's play/pause button stays disabled (it drives
+    // video_player, not the browser view).
+    // v159 second pass — the video area is COMPLETELY CLEAN: no
+    // text is ever drawn over the video (the old black54 note bar
+    // collided with the viewer's controls and covered the video).
+    // The browser view loads the WRAPPER page (cover-fit <video>,
+    // no browser chrome), not the raw MP4 URL — Gecko's built-in
+    // media viewer is never shown. The decoder note lives under
+    // the mockup (the hint line), never on the picture.
     if (_browserFallback) {
       final path = widget.videoPath!;
-      final fileUrl = Uri.file(path).toString();
+      final fileUrl =
+          _browserFallbackUrl ?? Uri.file(path).toString();
       final browserView = widget.videoBrowserViewBuilder?.call(fileUrl) ??
           GeckoVideoView(fileUrl: fileUrl);
       return Container(
         key: const ValueKey('deviceVideoBrowserFallback'),
         color: Colors.black,
-        child: Stack(
-          fit: StackFit.expand,
-          children: [
-            browserView,
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: Container(
-                color: Colors.black54,
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                child: Text(
-                  _decoderNote ?? '',
-                  key: const ValueKey('deviceVideoDecoderNote'),
-                  textAlign: TextAlign.center,
-                  maxLines: 3,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                      color: Colors.white, fontSize: 11),
-                ),
-              ),
-            ),
-          ],
-        ),
+        child: browserView,
       );
     }
     if (_videoError != null) {
@@ -534,12 +549,18 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
       child: Stack(
         fit: StackFit.expand,
         children: [
-          FittedBox(
-            fit: BoxFit.cover,
-            child: SizedBox(
-              width: ctl.value.size.width,
-              height: ctl.value.size.height,
-              child: VideoPlayer(ctl),
+          // v169 — own repaint layer for the video: the phone
+          // frame's overlays (shadows, gradients, clock) and the
+          // play/pause icon no longer share a layer with the
+          // texture, so the 60fps frames composite on their own.
+          RepaintBoundary(
+            child: FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: ctl.value.size.width,
+                height: ctl.value.size.height,
+                child: VideoPlayer(ctl),
+              ),
             ),
           ),
           if (!_videoPlaying)
@@ -602,7 +623,17 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
     // Keep the zoomed phone inside the dialog width (no overflow clipping).
     final fitCap = clampDouble(
         (MediaQuery.of(context).size.width - 64) / _phoneWidth, 0.6, 2.0);
-    final effZoom = clampDouble(_zoom, 0.6, fitCap);
+    // v159 second pass — and inside the dialog HEIGHT: the header,
+    // chip rows, controls, hint and buttons around the phone take
+    // ~420dp, plus the 24dp shadow slack in the phone-area box, so
+    // on a short phone viewport the frame is shrunk to fit instead
+    // of the dialog scrolling with the frame cut off behind the
+    // controls (live 2026-11-22: big black area on top, bottom cut
+    // off). The scroll view stays as a safety net for very short
+    // viewports.
+    final heightCap = clampDouble(
+        (MediaQuery.of(context).size.height - 444) / 560, 0.6, 2.0);
+    final effZoom = clampDouble(_zoom, 0.6, min(fitCap, heightCap));
     return Dialog(
       insetPadding: const EdgeInsets.all(16),
       child: SingleChildScrollView(
@@ -697,13 +728,24 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
                         _rotX += d.delta.dy * 0.012;
                       }),
                       onDoubleTap: _resetView,
-                      child: Transform.scale(
-                        scale: effZoom,
-                        alignment: Alignment.center,
-                        child: _PhoneFrame(
-                          imageUrl: widget.videoPath == null
-                              ? _currentImageUrl
-                              : null,
+                      // v159 second pass — layout-affecting scale:
+                      // Transform.scale only shrinks the PAINTING
+                      // while the frame still lays out 572 tall,
+                      // so a small effZoom squashed the frame and
+                      // its screen content overflowed (lock overlay
+                      // +158px in the test viewport). FittedBox
+                      // scales the layout too, so the phone really
+                      // is effZoom-sized (572 must match
+                      // _PhoneFrame._h).
+                      child: SizedBox(
+                        width: _phoneWidth * effZoom,
+                        height: 572 * effZoom,
+                        child: FittedBox(
+                          fit: BoxFit.contain,
+                          child: _PhoneFrame(
+                            imageUrl: widget.videoPath == null
+                                ? _currentImageUrl
+                                : null,
                           screenChild: widget.videoPath == null
                               ? null
                               : _videoScreen,
@@ -721,6 +763,7 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
                   ),
                 ),
               ),
+            ),
               const SizedBox(height: 8),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -779,10 +822,12 @@ class _DevicePreviewDialogState extends State<_DevicePreviewDialog>
                   widget.videoPath == null
                       ? 'Drag to rotate 360 deg. Scroll or use the buttons to zoom. Double-tap to reset.'
                       : _browserFallback
-                          // v156 — the browser view has its own tap
-                          // controls; the dialog's play/pause button
-                          // drives video_player and stays disabled.
-                          ? 'Browser view-e cholche — video-te tap korle play/pause hobe.'
+                          // v159 second pass — the decoder note
+                          // (with the measured codec line) lives
+                          // HERE, under the mockup — never drawn
+                          // over the video.
+                          ? _decoderNote ??
+                              'Browser view-e cholche — video-te tap korle play/pause hobe.'
                           : 'Video-te tap korle play/pause hobe — lock/home mode-e dekhle live wallpaper kemon lagbe bujha jabe.',
                   textAlign: TextAlign.center,
                   style: textTheme.bodySmall?.copyWith(

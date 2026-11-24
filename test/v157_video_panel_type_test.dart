@@ -7,6 +7,7 @@
 // and the choice flows into the queue record.
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -143,6 +144,11 @@ void main() {
       http.Request? fbReq;
       final client = MockClient((req) async {
         if (req.url.host == 'worker.example.com') {
+          if (req.headers['X-File-Type'] == 'image/jpeg') {
+            return http.Response(
+                '{"url": "https://r2.example.com/zedge1/wallpaper/123_x_thumb.jpg"}',
+                200);
+          }
           return http.Response(
               '{"url": "https://r2.example.com/zedge1/wallpaper/123_x.mp4"}',
               200);
@@ -167,7 +173,14 @@ void main() {
           'defaultTarget': 'spread',
         }),
       });
-      final engine = StudioEngine(client: client);
+      final engine = StudioEngine(
+        client: client,
+        // v159 second pass — the thumbnail guarantee: the upload
+        // now needs a real cover capture (the default returns
+        // null on this desktop host, which would block it).
+        coverCapture: (path, {int timeMs = 1000}) async =>
+            Uint8List.fromList([0xFF, 0xD8, 0xFF, 0xD9]),
+      );
       final live = video(
           id: 'v1', panelType: kVideoPanelTypeLive, localPath: path);
       // With metadata already present, no Gemini call is made.
@@ -216,6 +229,7 @@ void main() {
             firebaseKey: '-Nk',
             metadata: null,
             thumbUrl: null,
+            coverError: null,
           );
         },
       );

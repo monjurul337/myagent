@@ -15,9 +15,14 @@ library;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:image/image.dart' as img;
 
 import 'animation_engine.dart';
 import 'animation_models.dart';
+import 'gallery_save.dart';
+import 'meta_card_style.dart';
+import 'models.dart';
+import 'video_cover.dart';
 import 'voice_prompt.dart';
 
 class AnimationSection extends StatefulWidget {
@@ -37,12 +42,18 @@ class AnimationSection extends StatefulWidget {
     // spends quota, so it is the user's tap, never automatic).
     // Null = no retry offered (e.g. tests / old call sites).
     this.onRetry60Fps,
+    this.onBulkGenerate,
   });
 
   final AnimationEngine engine;
   final bool signedIn;
   final bool wide;
   final Future<void> Function(String prompt, String modelId) onGenerate;
+  // v163 — bulk: when the prompt box holds several lines, Generate
+  // runs one animation per line (AnimationEngine.startBulk). Null
+  // = run on the engine directly (tests / old call sites).
+  final Future<void> Function(List<String> prompts, String modelId)?
+      onBulkGenerate;
   final void Function(AnimationVideo video) onPlay;
   final void Function(AnimationVideo video) onDelete;
   final VoidCallback onExportZip;
@@ -63,9 +74,35 @@ class _AnimationSectionState extends State<AnimationSection> {
   bool _listening = false;
   // v133 — Animation gallery grid columns (1..6, default 3 like generate-main).
   int _gridCols = 3;
+  // v159 second pass — per-video metadata expand state: the image
+  // card's single shared bool cannot be reused across a list (one
+  // tap would expand every card). One video id in here = its
+  // metadata block is expanded.
+  final Set<String> _expandedVideoMeta = {};
   final _scrollCtrl = ScrollController();
   final _galleryKey = GlobalKey();
   int _seenVideoCount = 0;
+  // v166 — manual cover-frame picker: one video id in here = its
+  // picker row is open. Candidates are captured on demand (never
+  // per card) and downscaled for display once, so opening the
+  // picker never re-captures or re-decodes.
+  final Set<String> _coverPickerOpen = {};
+  final Map<String, List<_CoverThumb>> _coverThumbs = {};
+  final Map<String, bool> _coverLoading = {};
+  final Map<String, String?> _coverError = {};
+  // v167 — all-dark note under the picker header: the frames
+  // are still shown (and still pickable), but the row says why
+  // they are all dark, with the per-path diagnostic.
+  final Map<String, String?> _coverNote = {};
+  // v169 — the card's own preview: right after a video is
+  // generated (before any panel upload gives it a thumbUrl) the
+  // preview pane shows the video's real 3-4s frame, captured
+  // from the local file once per video and kept here. Captures
+  // run one at a time so a batch of new videos never decodes in
+  // parallel.
+  final Map<String, Uint8List> _localPreview = {};
+  final Set<String> _localPreviewRequested = {};
+  Future<void> _localPreviewQueue = Future<void>.value();
 
 
   /// v93 — the screen's colours come from the app theme (dark
@@ -156,6 +193,155 @@ class _AnimationSectionState extends State<AnimationSection> {
     );
   }
 
+  /// v163 — Generate from the SAME prompt box: one line = one
+  /// animation through the existing [onGenerate] (exactly as
+  /// today); several lines = one animation per line through
+  /// [onBulkGenerate] (or the engine directly when no callback
+  /// was passed). The box text is NOT cleared here — it stays
+  /// until the user taps Clear, so a failed line can be re-run.
+  Future<void> _onGenerateTap() async {
+    final lines = parseBulkAnimationPrompts(_promptCtrl.text);
+    if (lines.isEmpty) return;
+    if (lines.length == 1) {
+      await widget.onGenerate(lines.first, widget.engine.selectedModelId);
+      return;
+    }
+    final cb = widget.onBulkGenerate;
+    if (cb != null) {
+      await cb(lines, widget.engine.selectedModelId);
+    } else if (widget.engine.bulkOneMessage && widget.engine.supportsBatch) {
+      await widget.engine.startBulkBatch(
+        prompts: lines,
+        modelId: widget.engine.selectedModelId,
+        signedIn: widget.signedIn,
+      );
+    } else {
+      await widget.engine.startBulk(
+        prompts: lines,
+        modelId: widget.engine.selectedModelId,
+        signedIn: widget.signedIn,
+      );
+    }
+  }
+
+  /// v163 — the bulk run's per-line list: status icon + prompt +
+  /// failure/skip reason, with a Stop button while the queue runs.
+  Widget _bulkItemList() {
+    final engine = widget.engine;
+    return Container(
+      key: const ValueKey('animBulkList'),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: _cs.surfaceContainerHighest.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: _cs.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.queue_outlined, size: 16, color: _cs.primary),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  'Bulk — ${engine.bulkItems.length} line',
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: _cs.onSurface),
+                ),
+              ),
+              if (engine.bulkRunning)
+                InkWell(
+                  key: const ValueKey('animBulkStopButton'),
+                  onTap: () => engine.cancelBulk(),
+                  child: const Padding(
+                    padding: EdgeInsets.all(4),
+                    child: Text('Stop',
+                        style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                            color: Color(0xFFF87171))),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          for (final item in engine.bulkItems)
+            Padding(
+              key: ValueKey('animBulkItem-${item.id}'),
+              padding: const EdgeInsets.only(top: 6),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _bulkStatusIcon(item.status),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          item.prompt,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                              fontSize: 12, color: _cs.onSurface),
+                        ),
+                        // v169 — the failure text is hidden (user order
+                        // 2026-11-24): a failed line keeps only the red
+                        // error icon; the reason stays in the Error log.
+                        if (item.note.isNotEmpty &&
+                            item.status != BulkAnimationStatus.failed)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 2),
+                            child: Text(
+                              item.note,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: item.status ==
+                                          BulkAnimationStatus.failed
+                                      ? const Color(0xFFF87171)
+                                      : const Color(0xFFFFB020)),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _bulkStatusIcon(BulkAnimationStatus status) {
+    switch (status) {
+      case BulkAnimationStatus.queued:
+        return Icon(Icons.schedule_outlined,
+            size: 16, color: _cs.onSurface.withValues(alpha: 0.54));
+      case BulkAnimationStatus.running:
+        return SizedBox(
+          width: 16,
+          height: 16,
+          child: CircularProgressIndicator(
+              strokeWidth: 2, color: _cs.primary),
+        );
+      case BulkAnimationStatus.done:
+        return const Icon(Icons.check_circle_outline,
+            size: 16, color: Colors.green);
+      case BulkAnimationStatus.failed:
+        return const Icon(Icons.error_outline,
+            size: 16, color: Color(0xFFF87171));
+      case BulkAnimationStatus.skipped:
+        return const Icon(Icons.block_outlined,
+            size: 16, color: Color(0xFFFFB020));
+    }
+  }
+
   /// v88 — Polish: rewrites the prompt via the Gemini session
   /// (same flow as the image Prompt Polish), then puts the
   /// polished text back in the field.
@@ -193,12 +379,25 @@ class _AnimationSectionState extends State<AnimationSection> {
   Widget _promptCard(bool isAndroid) {
     final engine = widget.engine;
     final prompt = _promptCtrl.text.trim();
-    // v88 — Generate stays off while a copyright-risk term is in
-    // the prompt (the engine also blocks it at start()).
-    final safetyFlags = checkAnimationPromptSafety(prompt);
-    final canGenerate = prompt.isNotEmpty &&
-        safetyFlags.isEmpty &&
+    // v163 — BULK in the SAME box (user correction 2026-11-22:
+    // "আলাদা করে পোস্ট বক্স বানানোর দরকার নাই — ওই আগের যে বক্স
+    // আছে ওটাতেই রাখি সিস্টেম"): when the box holds several lines,
+    // each non-empty line is one prompt and Generate runs one
+    // animation per line, in order (see startBulk). One line = one
+    // animation, exactly as today. A copyright-risk line does NOT
+    // disable Generate for the rest — it is skipped with a note
+    // and the clean lines still run; Generate stays off only when
+    // NO line is runnable.
+    final bulkLines = parseBulkAnimationPrompts(_promptCtrl.text);
+    final runnableLines = bulkLines
+        .where((l) => checkAnimationPromptSafety(l).isEmpty)
+        .toList();
+    final safetyFlags = <String>{
+      for (final l in bulkLines) ...checkAnimationPromptSafety(l),
+    }.toList();
+    final canGenerate = runnableLines.isNotEmpty &&
         !engine.busy &&
+        !engine.bulkRunning &&
         widget.signedIn;
     return Card(
       shape: RoundedRectangleBorder(
@@ -330,7 +529,15 @@ class _AnimationSectionState extends State<AnimationSection> {
                             size: 18,
                             color: _cs.onSurface.withValues(alpha: 0.54)),
                         tooltip: 'Clear',
-                        onPressed: () => _promptCtrl.clear(),
+                        // v163 — Clear empties the box AND the bulk
+                        // run's per-line list (fresh start); the
+                        // box text itself is kept after Generate
+                        // until this tap, so a failed line can be
+                        // re-run by generating again.
+                        onPressed: () {
+                          _promptCtrl.clear();
+                          widget.engine.clearBulkItems();
+                        },
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints.tightFor(
                             width: 36, height: 36),
@@ -339,20 +546,55 @@ class _AnimationSectionState extends State<AnimationSection> {
                 ),
               ),
             ),
+            // v169 — bulk mode switch: one Gemini message per line
+            // (default) or ONE message for every line.
+            if (bulkLines.length > 1 && engine.supportsBatch)
+              SwitchListTile(
+                key: const ValueKey('animBulkOneMessage'),
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Ek message-e shob prompt',
+                    style: TextStyle(fontSize: 13)),
+                subtitle: Text(
+                    'Gemini-ke ekbar-e shob video banate bolbe. Off = '
+                    'prottek line alada (nirapod).',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: _cs.onSurface.withValues(alpha: 0.6))),
+                value: engine.bulkOneMessage,
+                onChanged: engine.bulkRunning
+                    ? null
+                    : (v) => engine.setBulkOneMessage(v),
+              ),
             const SizedBox(height: 8),
             // v109 — reference layout: live character count under
             // the prompt field.
-            Align(
-              alignment: Alignment.centerRight,
-              child: ListenableBuilder(
-                listenable: _promptCtrl,
-                builder: (context, _) => Text(
-                  '${_promptCtrl.text.length}/16384',
-                  style: TextStyle(
-                      fontSize: 11,
-                      color: _cs.onSurface.withValues(alpha: 0.54)),
+            Row(
+              children: [
+                // v163 — multi-line hint: when the box holds several
+                // prompts, say so — each line becomes one animation.
+                if (bulkLines.length > 1)
+                  Expanded(
+                    child: Text(
+                      '${bulkLines.length} line — prottek line ekta '
+                      'animation banabe, ekta sesh hole porer-ta.',
+                      style: TextStyle(
+                          fontSize: 11,
+                          color: _cs.primary),
+                    ),
+                  )
+                else
+                  const Spacer(),
+                ListenableBuilder(
+                  listenable: _promptCtrl,
+                  builder: (context, _) => Text(
+                    '${_promptCtrl.text.length}/16384',
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: _cs.onSurface.withValues(alpha: 0.54)),
+                  ),
                 ),
-              ),
+              ],
             ),
             // v88 — copyright guard: the warning shows live while a
             // blocked term is in the prompt — a copy gets his Zedge
@@ -382,11 +624,14 @@ class _AnimationSectionState extends State<AnimationSection> {
             const SizedBox(height: 12),
             FilledButton.icon(
               key: const ValueKey('animGenerateButton'),
-              onPressed: canGenerate
-                  ? () => widget.onGenerate(prompt, engine.selectedModelId)
-                  : null,
+              onPressed: canGenerate ? _onGenerateTap : null,
               icon: const Icon(Icons.movie_creation_outlined, size: 18),
-              label: const Text('Generate animation'),
+              // v163 — the button says how many animations the box
+              // will make: one line = "Generate animation" as
+              // before, several lines = "Generate N animations".
+              label: Text(bulkLines.length > 1
+                  ? 'Generate ${bulkLines.length} animations'
+                  : 'Generate animation'),
               // v109 — reference layout: big solid call-to-action,
               // 56px tall like the Studio Generate button.
               style: FilledButton.styleFrom(
@@ -426,6 +671,14 @@ class _AnimationSectionState extends State<AnimationSection> {
                     ),
                 ],
               ),
+            ],
+            // v163 — bulk per-line status (only while a bulk run's
+            // lines exist): each line shows queued → running →
+            // done/failed/skipped with its reason, so he can see
+            // which line is generating and which one failed.
+            if (engine.bulkItems.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              _bulkItemList(),
             ],
             // v140 — error log: the last backend failures, so he can
             // see WHAT went wrong and report it. Only when non-empty.
@@ -876,6 +1129,13 @@ class _AnimationSectionState extends State<AnimationSection> {
               engine.videos.isEmpty ? null : widget.onUploadAllToPanel,
         ),
         IconButton(
+          key: const ValueKey('animSaveAllGallery'),
+          icon: Icon(Icons.download_for_offline_outlined,
+              color: _cs.onSurface.withValues(alpha: 0.7)),
+          tooltip: 'Save all to Gallery',
+          onPressed: engine.videos.isEmpty ? null : _saveAllToGallery,
+        ),
+        IconButton(
           key: const ValueKey('animExportZip'),
           icon: Icon(Icons.archive_outlined, color: _cs.onSurface.withValues(alpha: 0.7)),
           tooltip: 'Export ZIP',
@@ -1035,6 +1295,21 @@ class _AnimationSectionState extends State<AnimationSection> {
                 Text(
                   v.fpsNote,
                   maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                      fontSize: 10, color: Color(0xFFFFB020)),
+                ),
+              ],
+              // v159 second pass — over-target file: Gemini gave a
+              // bigger file than the 10 MB asked for — say so on
+              // the card instead of silently accepting it. The
+              // video itself stays usable.
+              if (v.sizeNote.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                Text(
+                  v.sizeNote,
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                   textAlign: TextAlign.center,
                   style: const TextStyle(
@@ -1361,10 +1636,17 @@ class _AnimationSectionState extends State<AnimationSection> {
   }
 
   Widget _videoCard(AnimationVideo v) {
-    // v120 — one compact row (~64px, was ~120px): the play tile
-    // taps to play, title + spec share one column, and Metadata /
-    // Upload / Delete are icon-only with tooltips. Labeled buttons
-    // did not fit beside the title (v87); 36px icons do.
+    // v161 — TWO-PART card (user order 2026-11-22: the old card
+    // "কেমন বিচ্ছিরি হয়ে গেছে"): left = ONLY the video preview
+    // (small 9:16 pane, tap opens the device preview — no text,
+    // no note overlaid on the frame, per the v159 rule), right =
+    // the metadata, neatly arranged in the image-card-style block
+    // (AI title + pill + source + description + tags) or, when
+    // there is none yet, the prompt title + spec + metadata state.
+    // Below the split: the spec line (when metadata is shown),
+    // the Panel chips (v157) and the action icons — nothing
+    // dropped, only rearranged. The grid tile is unchanged (a
+    // 3-column tile is too narrow for a split).
     final busy = widget.engine.busyVideoId == v.id;
     return Card(
       shape: RoundedRectangleBorder(
@@ -1372,113 +1654,45 @@ class _AnimationSectionState extends State<AnimationSection> {
         side: BorderSide(color: _cs.outlineVariant),
       ),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-            InkWell(
-              key: ValueKey('animPlay-${v.id}'),
-              onTap: () => widget.onPlay(v),
-              borderRadius: BorderRadius.circular(10),
-              child: Container(
-                width: 40,
-                height: 40,
-                decoration: BoxDecoration(
-                  color: _cs.primary.withValues(alpha: 0.16),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Icon(Icons.play_circle_outline,
-                    color: _cs.primary, size: 22),
-              ),
-            ),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(v.title,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w600,
-                          color: _cs.onSurface)),
-                  const SizedBox(height: 2),
-                  Text.rich(
-                    TextSpan(
-                      children: [
-                        TextSpan(text: v.cardLine),
-                        if (v.isUploaded)
-                          TextSpan(
-                            text: ' · Queued on ${v.uploadedAccount}',
-                            style: TextStyle(color: _cs.primary),
-                          ),
+                // v169 — the spec (duration · resolution · fps ·
+                // size · style · model) sits UNDER the preview, in
+                // the empty space the taller metadata block left
+                // there (user screenshot 2026-11-23), instead of
+                // a full-width line below the split.
+                SizedBox(
+                  width: 84,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _videoPreviewPane(v),
+                      if (v.hasMetadata) ...[
+                        const SizedBox(height: 6),
+                        _videoSpecBlock(v, compact: true),
                       ],
-                    ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                        fontSize: 12,
-                        color: _cs.onSurface.withValues(alpha: 0.54)),
+                    ],
                   ),
-                  // v154 — honest fps note under the spec line.
-                  if (v.fpsNote.isNotEmpty) ...[
-                    const SizedBox(height: 2),
-                    Text(
-                      v.fpsNote,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                          fontSize: 11, color: Color(0xFFFFB020)),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-            _animIconAction(
-              key: ValueKey('animMeta-${v.id}'),
-              icon: v.hasMetadata
-                  ? Icons.auto_awesome
-                  : Icons.auto_awesome_outlined,
-              tooltip: v.hasMetadata ? 'Metadata' : 'AI Metadata',
-              color: v.hasMetadata
-                  ? _cs.primary
-                  : _cs.onSurface.withValues(alpha: 0.7),
-              onPressed: busy ? null : () => _onMetadataTap(v),
-            ),
-            _animIconAction(
-              key: ValueKey('animUpload-${v.id}'),
-              icon: v.isUploaded
-                  ? Icons.cloud_done_outlined
-                  : Icons.cloud_upload_outlined,
-              tooltip: v.isUploaded ? 'Queued' : 'Upload',
-              color: v.isUploaded
-                  ? _cs.primary
-                  : _cs.onSurface.withValues(alpha: 0.7),
-              onPressed: busy ? null : () => widget.onUploadToPanel(v),
-            ),
-            // v154 — retry at 60fps (see _confirmRetry60Fps).
-            if (_needsRetry60Fps(v))
-              _animIconAction(
-                key: ValueKey('animRetry60-${v.id}'),
-                icon: Icons.sixty_fps,
-                tooltip: 'Retry 60fps',
-                color: const Color(0xFFFFB020),
-                onPressed: busy ? null : () => _confirmRetry60Fps(v),
-              ),
-            _animIconAction(
-              key: ValueKey('animDelete-${v.id}'),
-              icon: Icons.delete_outline,
-              tooltip: 'Delete',
-              color: _cs.onSurface.withValues(alpha: 0.54),
-              onPressed: () => widget.onDelete(v),
-            ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: v.hasMetadata
+                      ? _videoMetaBlock(v)
+                      : _videoNoMetaColumn(v, busy),
+                ),
               ],
             ),
+            // v166 — manual cover picker (user order 2026-11-23):
+            // choose the cover frame instead of trusting the auto
+            // capture (which kept returning black frames).
+            if (_coverPickerOpen.contains(v.id)) _coverPickerRow(v),
             // v157 — per-video panel section (user decision
             // 2026-11-22): the panel files by the record's
             // contentType, so the card picks it before upload —
@@ -1502,15 +1716,621 @@ class _AnimationSectionState extends State<AnimationSection> {
                 ],
               ),
             ),
-            // v156 — the video's AI metadata attached to its card
-            // (see _videoMetaBlock): image cards show metadata with
-            // the image, video cards only hid it behind the
-            // sparkle-icon dialog. The card stays compact when no
-            // metadata was generated yet.
-            if (v.hasMetadata) _videoMetaBlock(v),
+            // Actions moved under the split (they sat beside the
+            // title before): Metadata / Upload / Retry 60fps /
+            // Delete, same keys + handlers as before.
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  // v166 — manual cover frame picker (user order
+                  // 2026-11-23): the auto capture kept returning
+                  // black frames, so the user picks the frame
+                  // himself. Primary colour when a pick exists.
+                  _animIconAction(
+                    key: ValueKey('animGallery-${v.id}'),
+                    icon: Icons.download_outlined,
+                    tooltip: 'Save to Gallery',
+                    color: _cs.onSurface.withValues(alpha: 0.7),
+                    onPressed: busy ? null : () => _saveToGallery(v),
+                  ),
+                  _animIconAction(
+                    key: ValueKey('animCover-${v.id}'),
+                    icon: v.pickedCoverTimeMs >= 0
+                        ? Icons.image
+                        : Icons.image_outlined,
+                    tooltip: 'Cover frame',
+                    color: v.pickedCoverTimeMs >= 0
+                        ? _cs.primary
+                        : _cs.onSurface.withValues(alpha: 0.7),
+                    onPressed: busy ? null : () => _onCoverTap(v),
+                  ),
+                  _animIconAction(
+                    key: ValueKey('animMeta-${v.id}'),
+                    icon: v.hasMetadata
+                        ? Icons.auto_awesome
+                        : Icons.auto_awesome_outlined,
+                    tooltip: v.hasMetadata ? 'Metadata' : 'AI Metadata',
+                    color: v.hasMetadata
+                        ? _cs.primary
+                        : _cs.onSurface.withValues(alpha: 0.7),
+                    onPressed: busy ? null : () => _onMetadataTap(v),
+                  ),
+                  _animIconAction(
+                    key: ValueKey('animUpload-${v.id}'),
+                    icon: v.isUploaded
+                        ? Icons.cloud_done_outlined
+                        : Icons.cloud_upload_outlined,
+                    tooltip: v.isUploaded ? 'Queued' : 'Upload',
+                    color: v.isUploaded
+                        ? _cs.primary
+                        : _cs.onSurface.withValues(alpha: 0.7),
+                    onPressed: busy
+                        ? null
+                        : () => widget.onUploadToPanel(v),
+                  ),
+                  // v154 — retry at 60fps (see _confirmRetry60Fps).
+                  if (_needsRetry60Fps(v))
+                    _animIconAction(
+                      key: ValueKey('animRetry60-${v.id}'),
+                      icon: Icons.sixty_fps,
+                      tooltip: 'Retry 60fps',
+                      color: const Color(0xFFFFB020),
+                      onPressed: busy ? null : () => _confirmRetry60Fps(v),
+                    ),
+                  _animIconAction(
+                    key: ValueKey('animDelete-${v.id}'),
+                    icon: Icons.delete_outline,
+                    tooltip: 'Delete',
+                    color: _cs.onSurface.withValues(alpha: 0.54),
+                    onPressed: () => widget.onDelete(v),
+                  ),
+                ],
+              ),
+            ),
           ],
         ),
       ),
+    );
+  }
+
+  void _toast(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(text)));
+  }
+
+  /// v169 — copies one finished video into the phone Gallery.
+  Future<void> _saveToGallery(AnimationVideo v) async {
+    if (!GallerySave.supported) {
+      _toast('Gallery-te save shudhu Android-e.');
+      return;
+    }
+    try {
+      final ok = await GallerySave.saveVideo(v.localPath, v.fileName);
+      _toast(ok
+          ? 'Gallery-te save holo (Movies/Zedge Studio).'
+          : 'Save hoyni — video file khuje pelam na.');
+    } catch (e) {
+      _toast('Gallery-te save hoyni: $e');
+    }
+  }
+
+  /// v169 — copies every finished video into the phone Gallery.
+  Future<void> _saveAllToGallery() async {
+    if (!GallerySave.supported) {
+      _toast('Gallery-te save shudhu Android-e.');
+      return;
+    }
+    final list = List<AnimationVideo>.of(widget.engine.videos);
+    var ok = 0;
+    var failed = 0;
+    _toast('${list.length} video Gallery-te save hocche…');
+    for (final v in list) {
+      try {
+        if (await GallerySave.saveVideo(v.localPath, v.fileName)) {
+          ok++;
+        } else {
+          failed++;
+        }
+      } catch (_) {
+        failed++;
+      }
+    }
+    _toast(failed == 0
+        ? '$ok video Gallery-te save holo (Movies/Zedge Studio).'
+        : '$ok save holo, $failed hoyni.');
+  }
+
+  /// v166 — Cover icon: toggles the picker row on the card.
+  /// Candidates are captured on first open only (cached per
+  /// video id until the app restarts).
+  Future<void> _onCoverTap(AnimationVideo v) async {
+    if (_coverPickerOpen.contains(v.id)) {
+      setState(() => _coverPickerOpen.remove(v.id));
+      return;
+    }
+    setState(() => _coverPickerOpen.add(v.id));
+    if (!_coverThumbs.containsKey(v.id)) await _loadCoverCandidates(v);
+  }
+
+  /// v166 — captures the candidate frames for one video (panel
+  /// percentage points of its duration) and downscales them for
+  /// display. The full-res bytes are re-captured at upload time
+  /// from the picked timestamp, so the picker never holds five
+  /// 1620x2880 JPEGs in memory.
+  Future<void> _loadCoverCandidates(AnimationVideo v) async {
+    if (!mounted) return;
+    setState(() {
+      _coverLoading[v.id] = true;
+      _coverError[v.id] = null;
+      _coverNote[v.id] = null;
+    });
+    try {
+      final result = await widget.engine.coverCandidates(v);
+      if (!mounted) return;
+      final cands = result.frames;
+      if (cands.isEmpty) {
+        setState(() {
+          _coverLoading[v.id] = false;
+          _coverError[v.id] = result.diagnostic.isEmpty
+              ? 'Cover frame pelam na — video file-ta khule dekha jacche na.'
+              : 'Cover frame pelam na — ${result.diagnostic}';
+        });
+        return;
+      }
+      final thumbs = <_CoverThumb>[];
+      for (final c in cands) {
+        thumbs.add(_CoverThumb(
+            timeMs: c.timeMs,
+            bytes: _coverDisplayBytes(c.bytes),
+            luma: c.luma));
+      }
+      setState(() {
+        _coverThumbs[v.id] = thumbs;
+        _coverLoading[v.id] = false;
+        _coverError[v.id] = null;
+        // v167 — every candidate dark: the frames are still
+        // shown (and still pickable — a genuinely dark video
+        // can still want its brightest frame), but the row says
+        // why, with the per-path diagnostic.
+        _coverNote[v.id] = result.allDark
+            ? 'Sob frame-i ondhokar — ${result.diagnostic}'
+            : null;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _coverLoading[v.id] = false;
+        _coverError[v.id] = 'Cover frame khujte giye vul holo: $e';
+      });
+    }
+  }
+
+  /// v166 — the user tapped a candidate: persist the pick on
+  /// the video (the engine saves + sets the status line); the
+  /// next panel upload captures exactly this timestamp. The
+  /// setState repaints this card with the fresh video object —
+  /// the engine also emits through onChanged (the app rebuilds),
+  /// but the pick must repaint even when onChanged is not wired.
+  Future<void> _onCoverPick(AnimationVideo v, int timeMs) async {
+    await widget.engine.pickCoverFrame(v, timeMs);
+    if (mounted) setState(() {});
+  }
+
+  /// Downscales a full-res candidate JPEG to a ~60x107 display
+  /// thumb (the picker shows five of them; decoding five
+  /// 1620x2880 JPEGs at full size on the card would be ~90 MB
+  /// of pixels). Falls back to the original bytes on failure.
+  Uint8List _coverDisplayBytes(Uint8List bytes) {
+    try {
+      final decoded = img.decodeJpg(bytes);
+      if (decoded == null) return bytes;
+      final small = img.copyResize(decoded, width: 60, height: 107);
+      return Uint8List.fromList(img.encodeJpg(small, quality: 70));
+    } catch (_) {
+      return bytes;
+    }
+  }
+
+  /// v166 — the manual cover picker row (under the split, above
+  /// the spec line): the candidate frames for this video, each
+  /// with its timestamp; tapping one picks it (primary border +
+  /// check), 'Auto' clears the pick. Dark candidates are dimmed
+  /// so the user can tell a black frame before picking it.
+  Widget _coverPickerRow(AnimationVideo v) {
+    final thumbs = _coverThumbs[v.id];
+    final loading = _coverLoading[v.id] == true;
+    final error = _coverError[v.id];
+    final note = _coverNote[v.id];
+    final picked = v.pickedCoverTimeMs;
+    return Container(
+      key: ValueKey('coverPicker-${v.id}'),
+      margin: const EdgeInsets.only(top: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: _cs.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: _cs.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.image_outlined, size: 16, color: _cs.primary),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  picked >= 0
+                      ? 'Cover frame: ${(picked / 1000).toStringAsFixed(1)}s beche neoa'
+                      : 'Cover frame beche nao',
+                  style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: _cs.onSurface),
+                ),
+              ),
+              if (picked >= 0)
+                TextButton(
+                  key: ValueKey('coverAuto-${v.id}'),
+                  onPressed: () => _onCoverPick(v, -1),
+                  child: const Text('Auto', style: TextStyle(fontSize: 12)),
+                ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (note != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(note,
+                  style: TextStyle(fontSize: 12, color: _cs.error)),
+            ),
+          if (loading)
+            Row(
+              children: [
+                SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2, color: _cs.primary),
+                ),
+                const SizedBox(width: 8),
+                Text('Cover frame khujchi…',
+                    style: TextStyle(
+                        fontSize: 12,
+                        color: _cs.onSurface.withValues(alpha: 0.7))),
+              ],
+            )
+          else if (error != null)
+            Row(
+              children: [
+                Expanded(
+                  child: Text(error,
+                      style: TextStyle(fontSize: 12, color: _cs.error)),
+                ),
+                TextButton(
+                  onPressed: () => _loadCoverCandidates(v),
+                  child: const Text('Abar try koro',
+                      style: TextStyle(fontSize: 12)),
+                ),
+              ],
+            )
+          else if (thumbs != null)
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (final t in thumbs)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: _coverThumbButton(v, t),
+                    ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _coverThumbButton(AnimationVideo v, _CoverThumb t) {
+    final selected = v.pickedCoverTimeMs == t.timeMs;
+    return InkWell(
+      key: ValueKey('coverThumb-${v.id}-${t.timeMs}'),
+      onTap: () => _onCoverPick(v, t.timeMs),
+      borderRadius: BorderRadius.circular(10),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Stack(
+            children: [
+              Container(
+                width: 60,
+                height: 107,
+                clipBehavior: Clip.antiAlias,
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: selected ? _cs.primary : _cs.outlineVariant,
+                    width: selected ? 2.5 : 1,
+                  ),
+                ),
+                child: Opacity(
+                  opacity: t.isDark ? 0.45 : 1.0,
+                  child: Image.memory(t.bytes, fit: BoxFit.cover),
+                ),
+              ),
+              if (selected)
+                Positioned(
+                  right: 4,
+                  top: 4,
+                  child: Container(
+                    padding: const EdgeInsets.all(2),
+                    decoration: BoxDecoration(
+                      color: _cs.primary,
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(Icons.check,
+                        size: 14, color: _cs.onPrimary),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            '${(t.timeMs / 1000).toStringAsFixed(1)}s${t.isDark ? ' • ondhokar' : ''}',
+            style: TextStyle(
+                fontSize: 10,
+                color: t.isDark
+                    ? _cs.error
+                    : _cs.onSurface.withValues(alpha: 0.6)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// v169 — queues ONE local-frame capture for [v]'s preview pane
+  /// (no-op when already requested). The best frame of the 3-4s
+  /// window (the picked one when the user picked) is downscaled
+  /// to a pane-sized JPEG and the card repaints with it. Reuses
+  /// the picker's candidate thumbs so opening the Cover row
+  /// afterwards needs no second capture. Any failure leaves the
+  /// play mark in place (the Error log already has the reason).
+  void _requestLocalPreview(AnimationVideo v) {
+    if (_localPreviewRequested.contains(v.id)) return;
+    _localPreviewRequested.add(v.id);
+    _localPreviewQueue = _localPreviewQueue.then((_) async {
+      if (!mounted) return;
+      try {
+        final result = await widget.engine.coverCandidates(v);
+        if (!mounted || result.frames.isEmpty) return;
+        CoverCandidate? best;
+        for (final c in result.frames) {
+          if (v.pickedCoverTimeMs >= 0 && c.timeMs == v.pickedCoverTimeMs) {
+            best = c;
+            break;
+          }
+          if (best == null || (c.luma ?? 0) > (best.luma ?? 0)) best = c;
+        }
+        if (best == null) return;
+        final thumbs = <_CoverThumb>[
+          for (final c in result.frames)
+            _CoverThumb(
+                timeMs: c.timeMs,
+                bytes: _coverDisplayBytes(c.bytes),
+                luma: c.luma),
+        ];
+        final preview = _previewBytes(best.bytes);
+        setState(() {
+          _localPreview[v.id] = preview;
+          _coverThumbs.putIfAbsent(v.id, () => thumbs);
+        });
+      } catch (_) {
+        // The play mark stays; nothing else to do.
+      }
+    });
+  }
+
+  /// Pane-sized (2x of the 84px preview) JPEG of a full-res frame.
+  Uint8List _previewBytes(Uint8List bytes) {
+    try {
+      final decoded = img.decodeJpg(bytes);
+      if (decoded == null) return bytes;
+      final small = img.copyResize(decoded, width: 168, height: 299);
+      return Uint8List.fromList(img.encodeJpg(small, quality: 80));
+    } catch (_) {
+      return bytes;
+    }
+  }
+
+  /// v161 — the preview half of the two-part card: a small 9:16
+  /// pane with ONLY the preview in it — the panel cover frame
+  /// when the video has one (thumbUrl, set on panel upload), else
+  /// a centred play mark. No text of any kind is overlaid on the
+  /// frame (v159 rule). Tap opens the device preview as before
+  /// (same `animPlay-<id>` key as the old play tile).
+  Widget _videoPreviewPane(AnimationVideo v) {
+    const width = 84.0;
+    return InkWell(
+      key: ValueKey('animPlay-${v.id}'),
+      onTap: () => widget.onPlay(v),
+      borderRadius: BorderRadius.circular(12),
+      child: Container(
+        key: ValueKey('animPreview-${v.id}'),
+        width: width,
+        height: width * 16 / 9,
+        clipBehavior: Clip.antiAlias,
+        decoration: BoxDecoration(
+          color: _cs.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: _cs.outlineVariant),
+        ),
+        child: v.thumbUrl.isNotEmpty
+            ? Image.network(
+                v.thumbUrl,
+                fit: BoxFit.cover,
+                // Slow network (~30 KB/s): show the play mark
+                // while the frame loads instead of a blank pane.
+                loadingBuilder: (ctx, child, progress) =>
+                    progress == null ? child : _previewPlayMark(),
+                errorBuilder: (_, __, ___) => _previewPlayMark(),
+              )
+            : _localPreviewOrPlayMark(v),
+      ),
+    );
+  }
+
+  /// v169 — no panel cover yet: the locally captured real frame
+  /// when there is one, else the play mark (and the capture is
+  /// queued, after this frame is built).
+  Widget _localPreviewOrPlayMark(AnimationVideo v) {
+    final bytes = _localPreview[v.id];
+    if (bytes != null) {
+      return Image.memory(
+        bytes,
+        key: ValueKey('animLocalPreview-${v.id}'),
+        fit: BoxFit.cover,
+        gaplessPlayback: true,
+        errorBuilder: (_, __, ___) => _previewPlayMark(),
+      );
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _requestLocalPreview(v);
+    });
+    return _previewPlayMark();
+  }
+
+  Widget _previewPlayMark() {
+    return Center(
+      child: Container(
+        width: 44,
+        height: 44,
+        decoration: BoxDecoration(
+          color: _cs.primary.withValues(alpha: 0.16),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(Icons.play_arrow_rounded,
+            color: _cs.primary, size: 28),
+      ),
+    );
+  }
+
+  /// v161 — the card's spec lines (real duration · size · fps ·
+  /// style · model + the honest fps/size notes), shared by the
+  /// metadata side (under the split) and the no-metadata column.
+  Widget _videoSpecBlock(AnimationVideo v, {bool compact = false}) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text.rich(
+          TextSpan(
+            children: [
+              TextSpan(text: v.cardLine),
+              if (v.isUploaded)
+                TextSpan(
+                  text: ' · Queued on ${v.uploadedAccount}',
+                  style: TextStyle(color: _cs.primary),
+                ),
+            ],
+          ),
+          maxLines: compact ? 9 : 2,
+          overflow: TextOverflow.ellipsis,
+          style: TextStyle(
+              fontSize: compact ? 11 : 12,
+              color: _cs.onSurface.withValues(alpha: 0.54)),
+        ),
+        // v154 — honest fps note under the spec line.
+        if (v.fpsNote.isNotEmpty) ...[
+          const SizedBox(height: 2),
+          Text(
+            v.fpsNote,
+            maxLines: compact ? 3 : 1,
+            overflow: TextOverflow.ellipsis,
+            style:
+                const TextStyle(fontSize: 11, color: Color(0xFFFFB020)),
+          ),
+        ],
+        // v159 second pass — over-target file: Gemini gave a
+        // bigger file than the 10 MB asked for — say so on the
+        // card instead of silently accepting it. The video itself
+        // stays usable.
+        if (v.sizeNote.isNotEmpty) ...[
+          const SizedBox(height: 2),
+          Text(
+            v.sizeNote,
+            maxLines: compact ? 4 : 2,
+            overflow: TextOverflow.ellipsis,
+            style:
+                const TextStyle(fontSize: 11, color: Color(0xFFFFB020)),
+          ),
+        ],
+      ],
+    );
+  }
+
+  /// v161 — the metadata side when no AI metadata exists yet:
+  /// the prompt title + spec, then the metadata state — either
+  /// "banacche…" while the auto-fetch runs, or the Banglish
+  /// failure note + manual retry when it failed. Videos finished
+  /// before v161 keep the sparkle icon in the actions row below.
+  Widget _videoNoMetaColumn(AnimationVideo v, bool busy) {
+    final fetchingMeta = busy && widget.engine.busyAction == 'metadata';
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(v.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w600,
+                color: _cs.onSurface)),
+        const SizedBox(height: 4),
+        _videoSpecBlock(v),
+        if (fetchingMeta) ...[
+          const SizedBox(height: 8),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: _cs.primary),
+              ),
+              const SizedBox(width: 8),
+              Text('AI Metadata banacche…',
+                  style: TextStyle(
+                      fontSize: 12,
+                      color: _cs.onSurface.withValues(alpha: 0.7))),
+            ],
+          ),
+        ] else if (v.metadataFailed) ...[
+          const SizedBox(height: 8),
+          const Text('AI Metadata hoyni — abar try koro.',
+              style:
+                  TextStyle(fontSize: 12, color: Color(0xFFFFB020))),
+          const SizedBox(height: 2),
+          TextButton.icon(
+            key: ValueKey('animMetaRetry-${v.id}'),
+            onPressed: busy ? null : () => _onMetadataTap(v),
+            icon: const Icon(Icons.auto_awesome_outlined, size: 18),
+            label: const Text('AI Metadata'),
+            style: TextButton.styleFrom(
+              padding: EdgeInsets.zero,
+              minimumSize: Size.zero,
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -1542,9 +2362,11 @@ class _AnimationSectionState extends State<AnimationSection> {
   /// way image cards show metadata with the image: category pill +
   /// description + tag chips. [compact] is the grid tile (centred,
   /// smaller, tags in one scrollable row); the list card gets the
-  /// full block. Only called when [v.hasMetadata] is true.
+  /// full mirrored block (see [_videoMetaCard]). Only called when
+  /// [v.hasMetadata] is true.
   Widget _videoMetaBlock(AnimationVideo v, {bool compact = false}) {
     final meta = v.metadata!;
+    if (!compact) return _videoMetaCard(v, meta);
     final descStyle = TextStyle(
         fontSize: compact ? 10 : 12,
         color: _cs.onSurface.withValues(alpha: 0.7));
@@ -1619,6 +2441,143 @@ class _AnimationSectionState extends State<AnimationSection> {
     );
   }
 
+  /// v159 second pass — the LIST-card metadata block mirrors the
+  /// IMAGE card (`_metaCard` in main.dart) exactly: same container,
+  /// title row (the video's AI title + the same filled purple
+  /// uppercase pill + sparkle button), same source line, same
+  /// description sizing/behaviour, same tags behaviour, same
+  /// 'Aro dekho' toggle with the same show rule. Styling values
+  /// come from lib/meta_card_style.dart (shared with `_metaCard`)
+  /// so the two cards cannot drift apart again. Expanded state is
+  /// PER-VIDEO (`_expandedVideoMeta`) — the image card's single
+  /// shared bool cannot be reused across a list. The sparkle
+  /// regenerates the video's metadata via [_onMetadataTap] (the
+  /// injected `widget.onMetadata`); videos also come from the
+  /// signed-in Gemini web session, so the source line is the same
+  /// hardcoded 'gemini-web (cookie)' (SetMetadata has no source
+  /// field). The compact grid-tile variant stays compact (see
+  /// [_videoMetaBlock]).
+  Widget _videoMetaCard(AnimationVideo v, SetMetadata meta) {
+    final expanded = _expandedVideoMeta.contains(v.id);
+    final showToggle = metaShowsExpandToggle(
+        description: meta.description, tagCount: meta.tags.length);
+    return Container(
+      key: ValueKey('animMetaBlock-${v.id}'),
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: _cs.surfaceContainer,
+        borderRadius: BorderRadius.circular(kMetaCardRadius),
+      ),
+      padding: kMetaCardPadding,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Text(meta.title,
+                    style: const TextStyle(
+                        fontSize: 19, fontWeight: FontWeight.w700)),
+              ),
+              if (meta.category.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                  decoration: BoxDecoration(
+                    color: kMetaCategoryPillColor,
+                    borderRadius: BorderRadius.circular(999),
+                  ),
+                  child: Text(meta.category.toUpperCase(),
+                      style: const TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.8,
+                          color: Colors.white)),
+                ),
+              ],
+              IconButton(
+                tooltip: 'Rewrite with AI',
+                visualDensity: VisualDensity.compact,
+                onPressed: () => _onMetadataTap(v),
+                icon: Icon(Icons.auto_awesome,
+                    size: 20, color: _cs.onSurfaceVariant),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text('gemini-web (cookie)',
+              style: TextStyle(
+                  fontSize: 13.5, color: _cs.onSurfaceVariant)),
+          if (meta.description.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(meta.description,
+                maxLines: expanded ? null : 2,
+                overflow:
+                    expanded ? TextOverflow.visible : TextOverflow.ellipsis,
+                style: TextStyle(
+                    fontSize: 15,
+                    height: 1.35,
+                    color: _cs.onSurface)),
+          ],
+          if (meta.tags.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            if (expanded)
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [for (final tag in meta.tags) metaTagChip(tag)],
+              )
+            else
+              SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  children: [
+                    for (var i = 0; i < meta.tags.length; i++) ...[
+                      if (i > 0) const SizedBox(width: 8),
+                      metaTagChip(meta.tags[i]),
+                    ],
+                  ],
+                ),
+              ),
+          ],
+          if (showToggle) ...[
+            const SizedBox(height: 8),
+            GestureDetector(
+              key: ValueKey('animMetaExpandToggle-${v.id}'),
+              onTap: () => setState(() {
+                if (expanded) {
+                  _expandedVideoMeta.remove(v.id);
+                } else {
+                  _expandedVideoMeta.add(v.id);
+                }
+              }),
+              behavior: HitTestBehavior.opaque,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(expanded ? 'Kom dekho' : 'Aro dekho',
+                      style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                          color: _cs.primary)),
+                  const SizedBox(width: 2),
+                  Icon(
+                      expanded
+                          ? Icons.keyboard_arrow_up
+                          : Icons.keyboard_arrow_down,
+                      size: 16,
+                      color: _cs.primary),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   /// One compact 36px icon action for the video card (v120):
   /// IconButton's 48px minimum would not fit three of them beside
   /// the title, so the tap target is an explicit 36px box.
@@ -1675,4 +2634,22 @@ class _AnimationSectionState extends State<AnimationSection> {
       ],
     );
   }
+}
+
+/// v166 — one picker candidate, downscaled for display (the
+/// captured frame is full-res; showing five 1620x2880 JPEGs
+/// would decode ~90 MB of pixels on the card). [luma] is the
+/// v162 meter value, so the picker can dim dark frames.
+class _CoverThumb {
+  const _CoverThumb({
+    required this.timeMs,
+    required this.bytes,
+    this.luma,
+  });
+
+  final int timeMs;
+  final Uint8List bytes;
+  final double? luma;
+
+  bool get isDark => luma != null && luma! < kCoverMinLuminance;
 }

@@ -27,7 +27,7 @@ void main() {
     expect(find.text('Add Gmail'), findsOneWidget);
     expect(find.text('Verify'), findsOneWidget);
     expect(find.text('Switch account'), findsOneWidget);
-    expect(find.text('Version 2.5.93'), findsOneWidget);
+    expect(find.text('Version 2.5.102'), findsOneWidget);
   });
 
   testWidgets('v57 empty Showcase hides the disabled action row',

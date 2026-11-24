@@ -21,7 +21,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 class GeckoVideoView extends StatelessWidget {
-  /// file:// URL of the local MP4 to play.
+  /// URL of the page to play — normally the WRAPPER page URL
+  /// (see video_preview_wrapper.dart: a cover-fit `<video>`,
+  /// no browser chrome), not the raw MP4 URL: loading the raw
+  /// file shows Gecko's built-in media viewer with black bars.
   final String fileUrl;
 
   const GeckoVideoView({required this.fileUrl, super.key});
